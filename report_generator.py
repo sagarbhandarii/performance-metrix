@@ -156,19 +156,62 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
 def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "<tr><td colspan=\"4\">No runtime data available</td></tr>"
-    return "\n".join(
-        f"<tr><td>{row['device']}</td><td>{_fmt_num(row['cpu'])}</td><td>{_fmt_num(row['memory'])}</td><td>{_fmt_num(row['fps'])}</td></tr>"
-        for row in rows
-    )
+
+    def _perf_class_cpu(cpu: float | None) -> str:
+        if not isinstance(cpu, float):
+            return ""
+        if cpu > 70:
+            return "metric-bad"
+        if cpu < 40:
+            return "metric-good"
+        return "metric-medium"
+
+    def _perf_class_fps(fps: float | None) -> str:
+        if not isinstance(fps, float):
+            return ""
+        if fps >= 55:
+            return "metric-good"
+        if fps >= 35:
+            return "metric-medium"
+        return "metric-bad"
+
+    rows_html: List[str] = []
+    for row in rows:
+        rows_html.append(
+            "<tr>"
+            f"<td>{row['device']}</td>"
+            f"<td class=\"{_perf_class_cpu(row['cpu'])}\">{_fmt_num(row['cpu'])}</td>"
+            f"<td>{_fmt_num(row['memory'])}</td>"
+            f"<td class=\"{_perf_class_fps(row['fps'])}\">{_fmt_num(row['fps'])}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows_html)
 
 
 def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "<tr><td colspan=\"4\">No startup data available</td></tr>"
-    return "\n".join(
-        f"<tr><td>{row['device']}</td><td>{_fmt_num(row['cold_avg'])}</td><td>{_fmt_num(row['warm_avg'])}</td><td>{_fmt_num(row['hot_avg'])}</td></tr>"
-        for row in rows
-    )
+
+    def _perf_class_startup(startup_ms: float | None) -> str:
+        if not isinstance(startup_ms, float):
+            return ""
+        if startup_ms <= 2000:
+            return "metric-good"
+        if startup_ms <= 3500:
+            return "metric-medium"
+        return "metric-bad"
+
+    rows_html: List[str] = []
+    for row in rows:
+        rows_html.append(
+            "<tr>"
+            f"<td>{row['device']}</td>"
+            f"<td class=\"{_perf_class_startup(row['cold_avg'])}\">{_fmt_num(row['cold_avg'])}</td>"
+            f"<td class=\"{_perf_class_startup(row['warm_avg'])}\">{_fmt_num(row['warm_avg'])}</td>"
+            f"<td class=\"{_perf_class_startup(row['hot_avg'])}\">{_fmt_num(row['hot_avg'])}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows_html)
 
 
 def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -207,27 +250,153 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
   <title>Unified Android Performance Report</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2937; }}
-    h1 {{ margin-bottom: 24px; }}
-    section {{ margin-bottom: 28px; padding: 16px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-    th, td {{ border: 1px solid #d1d5db; padding: 8px 10px; text-align: left; }}
-    th {{ background: #f3f4f6; }}
-    .chart-wrap {{ max-width: 900px; margin: 0 auto 20px auto; }}
-    canvas {{ width: 100%; max-width: 900px; height: 360px; border: 1px solid #e5e7eb; border-radius: 6px; background: #fafafa; margin: 12px auto; display: block; }}
+    body {{
+      font-family: Arial, sans-serif;
+      background: #f5f7fa;
+      margin: 0;
+      padding: 20px;
+      color: #1f2937;
+    }}
+
+    .container {{
+      max-width: 1200px;
+      margin: 0 auto;
+    }}
+
+    .card {{
+      background: white;
+      padding: 20px;
+      margin-bottom: 20px;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }}
+
+    h1 {{
+      text-align: center;
+      margin-bottom: 30px;
+    }}
+
+    h2 {{
+      margin-top: 0;
+      margin-bottom: 16px;
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+    }}
+
+    th {{
+      background: #4CAF50;
+      color: white;
+      padding: 10px;
+      text-align: left;
+    }}
+
+    td {{
+      padding: 10px;
+      border-bottom: 1px solid #ddd;
+    }}
+
+    .summary {{
+      display: flex;
+      gap: 20px;
+    }}
+
+    .summary-card {{
+      flex: 1;
+      background: #ffffff;
+      padding: 15px;
+      border-radius: 10px;
+      text-align: center;
+      font-weight: bold;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+      border-top: 4px solid #4CAF50;
+    }}
+
+    .summary-card .label {{
+      display: block;
+      font-size: 14px;
+      color: #6b7280;
+      margin-bottom: 8px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }}
+
+    .summary-card .value {{
+      display: block;
+      font-size: 18px;
+      color: #111827;
+    }}
+
+    .metric-good {{
+      color: #15803d;
+      font-weight: 700;
+    }}
+
+    .metric-medium {{
+      color: #c2410c;
+      font-weight: 700;
+    }}
+
+    .metric-bad {{
+      color: #b91c1c;
+      font-weight: 700;
+    }}
+
+    .chart-wrap {{
+      display: grid;
+      gap: 20px;
+    }}
+
+    .chart-panel {{
+      background: #fafafa;
+      border: 1px solid #eceff3;
+      border-radius: 10px;
+      padding: 12px;
+    }}
+
+    .chart-panel h3 {{
+      margin: 0 0 12px;
+      font-size: 16px;
+    }}
+
+    canvas {{
+      width: 100%;
+      height: 340px;
+    }}
+
+    @media (max-width: 768px) {{
+      .summary {{
+        flex-direction: column;
+      }}
+    }}
   </style>
 </head>
 <body>
-<h1>Unified Android Performance Report</h1>
+<div class=\"container\">
+  <h1>Unified Android Performance Report</h1>
 
-<section>
+<div class=\"card\">
   <h2>Summary</h2>
-  <p>Fastest Device: {summary['fastest']}</p>
-  <p>Slowest Device: {summary['slowest']}</p>
-  <p>Overall Average: {summary['overall']}</p>
-</section>
+  <div class=\"summary\">
+    <div class=\"summary-card\">
+      <span class=\"label\">Fastest Device</span>
+      <span class=\"value\">{summary['fastest']}</span>
+    </div>
+    <div class=\"summary-card\">
+      <span class=\"label\">Slowest Device</span>
+      <span class=\"value\">{summary['slowest']}</span>
+    </div>
+    <div class=\"summary-card\">
+      <span class=\"label\">Avg Time</span>
+      <span class=\"value\">{summary['overall']}</span>
+    </div>
+  </div>
+</div>
 
-<section>
+<div class=\"card\">
   <h2>Runtime Performance</h2>
   <table>
     <tr>
@@ -238,9 +407,9 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
     </tr>
     {runtime_rows}
   </table>
-</section>
+</div>
 
-<section>
+<div class=\"card\">
   <h2>Startup Performance</h2>
   <table>
     <tr>
@@ -251,15 +420,22 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
     </tr>
     {startup_rows}
   </table>
-</section>
+</div>
 
-<section>
+<div class=\"card\">
   <h2>Performance Charts</h2>
   <div class=\"chart-wrap\">
-    <canvas id=\"barChart\"></canvas>
-    <canvas id=\"lineChart\"></canvas>
+    <div class=\"chart-panel\">
+      <h3>Average Launch Time by Mode</h3>
+      <canvas id=\"barChart\"></canvas>
+    </div>
+    <div class=\"chart-panel\">
+      <h3>Launch Time Trend (Top 10 Samples)</h3>
+      <canvas id=\"lineChart\"></canvas>
+    </div>
   </div>
-</section>
+</div>
+</div>
 
 <script src=\"static/chart.min.js\"></script>
 <script>
@@ -287,7 +463,14 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
         backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
       }}]
     }},
-    options: {{ responsive: true, maintainAspectRatio: false }}
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: {{ padding: 12 }},
+      plugins: {{
+        legend: {{ display: true, position: 'top' }}
+      }}
+    }}
   }});
 
   new Chart(ctx2, {{
@@ -300,7 +483,14 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
         {{ label: 'Hot', data: data.startup_metrics.hot.values, borderColor: '#22c55e', fill: false }}
       ]
     }},
-    options: {{ responsive: true, maintainAspectRatio: false }}
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      layout: {{ padding: 12 }},
+      plugins: {{
+        legend: {{ display: true, position: 'top' }}
+      }}
+    }}
   }});
 }});
 </script>
