@@ -159,12 +159,17 @@ def _extract_metrics(record: Dict[str, Any]) -> Tuple[str, float, float, float, 
     )
 
 
+def _mean_or_default(values: Iterable[float], default: float = 0.0) -> float:
+    materialized = list(values)
+    return mean(materialized) if materialized else default
+
+
 def _build_html(rows: Iterable[Dict[str, Any]]) -> str:
     parsed_rows = [_extract_metrics(r) for r in rows]
 
     total_devices = len(parsed_rows)
-    avg_cpu = mean((r[1] for r in parsed_rows), default=0.0)
-    avg_mem = mean((r[2] for r in parsed_rows), default=0.0)
+    avg_cpu = _mean_or_default((r[1] for r in parsed_rows), default=0.0)
+    avg_mem = _mean_or_default((r[2] for r in parsed_rows), default=0.0)
 
     table_rows = []
     for device_id, cpu, mem, launch, fps, cpu_label, mem_label, launch_label, fps_label in parsed_rows:
