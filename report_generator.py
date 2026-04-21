@@ -8,8 +8,11 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Tuple
 
+import logging_config
+
 INPUT_FILE = Path("performance_results.json")
 OUTPUT_FILE = Path("report.html")
+LOGGER = logging_config.get_logger("report_generator")
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -45,13 +48,16 @@ def _pick(item: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 def _normalize_records(data: Any) -> List[Dict[str, Any]]:
     """Normalize possible JSON shapes into a list of device records."""
     if isinstance(data, list):
+        LOGGER.debug("Normalizing list-shaped data (%d records)", len(data))
         return [entry for entry in data if isinstance(entry, dict)]
 
     if isinstance(data, dict):
         if isinstance(data.get("devices"), list):
+            LOGGER.debug("Normalizing `devices` section")
             return [entry for entry in data["devices"] if isinstance(entry, dict)]
 
         if isinstance(data.get("results"), list):
+            LOGGER.debug("Normalizing `results` section")
             return [entry for entry in data["results"] if isinstance(entry, dict)]
 
         # Shape: {"device1": {...}, "device2": {...}}
@@ -63,6 +69,7 @@ def _normalize_records(data: Any) -> List[Dict[str, Any]]:
                 normalized.append(row)
             return normalized
 
+    LOGGER.error("Unsupported report input shape")
     return []
 
 
@@ -342,7 +349,9 @@ def _build_html(rows: Iterable[Dict[str, Any]]) -> str:
 
 
 def main() -> None:
+    logging_config.setup_logging()
     if not INPUT_FILE.exists():
+        LOGGER.error("Input file not found: %s", INPUT_FILE)
         raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
 
     with INPUT_FILE.open("r", encoding="utf-8") as f:
@@ -352,6 +361,7 @@ def main() -> None:
     html = _build_html(rows)
 
     OUTPUT_FILE.write_text(html, encoding="utf-8")
+    LOGGER.info("Report generated: %s", OUTPUT_FILE)
     print(f"Report generated: {OUTPUT_FILE}")
 
 

@@ -8,9 +8,12 @@ import threading
 from copy import deepcopy
 from typing import Any, Dict, List
 
+import logging_config
+
 DEVICE_FILE = os.path.join(os.path.dirname(__file__), "devices.json")
 _ALLOWED_STATUSES = {"available", "busy", "offline"}
 _LOCK = threading.RLock()
+LOGGER = logging_config.get_logger("device_registry")
 
 
 def _ensure_file_exists() -> None:
@@ -18,6 +21,7 @@ def _ensure_file_exists() -> None:
     if not os.path.exists(DEVICE_FILE):
         with open(DEVICE_FILE, "w", encoding="utf-8") as file:
             json.dump([], file, indent=2)
+        LOGGER.info("Created device registry file: %s", DEVICE_FILE)
 
 
 def _load_devices() -> List[Dict[str, Any]]:
@@ -28,6 +32,7 @@ def _load_devices() -> List[Dict[str, Any]]:
             data = json.load(file)
             return data if isinstance(data, list) else []
     except (json.JSONDecodeError, OSError):
+        LOGGER.error("Failed to read registry file: %s", DEVICE_FILE)
         return []
 
 
@@ -35,6 +40,7 @@ def _save_devices(devices: List[Dict[str, Any]]) -> None:
     """Persist device list to disk."""
     with open(DEVICE_FILE, "w", encoding="utf-8") as file:
         json.dump(devices, file, indent=2)
+    LOGGER.debug("Persisted %d devices to registry", len(devices))
 
 
 def _validate_device(device_object: Dict[str, Any]) -> None:
@@ -69,6 +75,7 @@ def add_device(device_object: Dict[str, Any]) -> Dict[str, Any]:
 
         devices.append(deepcopy(device_object))
         _save_devices(devices)
+        LOGGER.info("Added device to registry: %s", device_id)
 
     return deepcopy(device_object)
 
@@ -80,9 +87,11 @@ def remove_device(device_id: str) -> bool:
         filtered_devices = [d for d in devices if d.get("device_id") != device_id]
 
         if len(filtered_devices) == len(devices):
+            LOGGER.error("Attempted to remove unknown device: %s", device_id)
             return False
 
         _save_devices(filtered_devices)
+        LOGGER.info("Removed device from registry: %s", device_id)
         return True
 
 
@@ -103,5 +112,8 @@ def update_device_status(device_id: str, status: str) -> bool:
 
         if updated:
             _save_devices(devices)
+            LOGGER.info("Updated device status: %s -> %s", device_id, status)
+        else:
+            LOGGER.error("Device not found for status update: %s", device_id)
 
         return updated
