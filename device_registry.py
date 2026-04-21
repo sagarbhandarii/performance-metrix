@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from copy import deepcopy
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 import logging_config
 
@@ -54,6 +55,68 @@ def _validate_device(device_object: Dict[str, Any]) -> None:
             f"Invalid status '{device_object['status']}'. "
             f"Allowed: {sorted(_ALLOWED_STATUSES)}"
         )
+
+
+def _parse_adb_devices_output(output: str) -> Set[str]:
+    """Extract unique, online adb device ids from `adb devices` output."""
+    active: Set[str] = set()
+    for line in output.splitlines()[1:]:
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        parts = cleaned.split()
+        if len(parts) < 2:
+            continue
+        device_id, state = parts[0].strip(), parts[1].strip()
+        if state == "device":
+            active.add(device_id)
+    return active
+
+
+def get_active_devices() -> Set[str]:
+    """Return active adb device ids from `adb devices` (unique, online only)."""
+    try:
+        result = subprocess.run(
+            ["adb", "devices"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        LOGGER.error("Failed to execute adb devices: %s", error)
+        return set()
+
+    if result.returncode != 0:
+        LOGGER.error("adb devices failed: %s", (result.stderr or "").strip())
+        return set()
+
+    devices = _parse_adb_devices_output(result.stdout or "")
+    LOGGER.info("Detected active adb devices: %s", sorted(devices))
+    return devices
+
+
+def cleanup_registry(active_devices: Set[str] | None = None) -> List[Dict[str, Any]]:
+    """Remove duplicate/stale entries and return cleaned registry."""
+    active = active_devices if active_devices is not None else get_active_devices()
+    with _LOCK:
+        devices = _load_devices()
+        deduped: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for device in devices:
+            device_id = str(device.get("device_id", "")).strip()
+            if not device_id or device_id in seen:
+                continue
+            if device_id not in active:
+                continue
+            normalized = deepcopy(device)
+            normalized["device_id"] = device_id
+            normalized["status"] = "available"
+            deduped.append(normalized)
+            seen.add(device_id)
+        _save_devices(deduped)
+        LOGGER.info("Registry cleanup complete. Retained %d active device(s)", len(deduped))
+        return deepcopy(deduped)
 
 
 def get_all_devices() -> List[Dict[str, Any]]:

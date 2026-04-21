@@ -40,9 +40,25 @@ def _debug_log(message: str) -> None:
         file.write(f"{message}\n")
 
 
-def run_adb_command(cmd: List[str], timeout: int = 10) -> Dict[str, Any]:
+def _device_log_path(device_id: str) -> Path:
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", device_id)
+    path = Path("logs") / f"{safe_id}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _device_log(device_id: str, message: str) -> None:
+    with _device_log_path(device_id).open("a", encoding="utf-8") as file:
+        file.write(f"{message}\n")
+
+
+def run_adb_command(cmd: List[str], timeout: int = 10, device_id: str = "") -> Dict[str, Any]:
     """Run an adb command safely with timeout and structured response."""
     command_text = " ".join(cmd)
+    if device_id:
+        print(f"Running on device: {device_id}")
+        _device_log(device_id, f"Running on device: {device_id}")
+        _device_log(device_id, f"$ {command_text}")
     _debug_log(f"$ {command_text}")
     try:
         result = subprocess.run(
@@ -68,6 +84,11 @@ def run_adb_command(cmd: List[str], timeout: int = 10) -> Dict[str, Any]:
     _debug_log(f"stdout:\n{output}")
     if err:
         _debug_log(f"stderr:\n{err}")
+    if device_id:
+        if output:
+            _device_log(device_id, f"stdout: {output}")
+        if err:
+            _device_log(device_id, f"stderr: {err}")
 
     success = result.returncode == 0
     if not success and not err:
@@ -148,7 +169,7 @@ def parse_fps(gfxinfo_output: str) -> MetricValue:
 
 
 def _start_app(target: str, component: str, timeout: int = 20) -> Dict[str, Any]:
-    return run_adb_command(["adb", "-s", target, "shell", "am", "start", "-W", "-n", component], timeout=timeout)
+    return run_adb_command(["adb", "-s", target, "shell", "am", "start", "-W", "-n", component], timeout=timeout, device_id=target)
 
 
 def run_start_test(device: str, start_type: str, component: str, package: str, iterations: int = 10) -> Dict[str, Any]:
@@ -157,12 +178,12 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
         _debug_log(f"[{device}] {start_type} iteration {i}/{iterations}")
 
         if start_type == "cold":
-            run_adb_command(["adb", "-s", device, "shell", "am", "force-stop", package], timeout=10)
+            run_adb_command(["adb", "-s", device, "shell", "am", "force-stop", package], timeout=10, device_id=device)
         elif start_type == "warm":
-            run_adb_command(["adb", "-s", device, "shell", "am", "start", "-n", component], timeout=15)
-            run_adb_command(["adb", "-s", device, "shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10)
+            run_adb_command(["adb", "-s", device, "shell", "am", "start", "-n", component], timeout=15, device_id=device)
+            run_adb_command(["adb", "-s", device, "shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10, device_id=device)
         elif start_type == "hot":
-            run_adb_command(["adb", "-s", device, "shell", "am", "start", "-n", component], timeout=15)
+            run_adb_command(["adb", "-s", device, "shell", "am", "start", "-n", component], timeout=15, device_id=device)
         else:
             raise ValueError(f"Unknown start type: {start_type}")
 
@@ -188,10 +209,10 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
 def collect_performance_metrics(target: str, package_name: str, activity_name: str) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
 
-    top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15)
-    mem = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "meminfo", package_name], timeout=15)
+    top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
+    mem = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "meminfo", package_name], timeout=15, device_id=target)
     launch = _start_app(target, component, timeout=20)
-    gfx = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "gfxinfo", package_name], timeout=20)
+    gfx = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "gfxinfo", package_name], timeout=20, device_id=target)
 
     _debug_log(f"Raw TOP output:\n{top['output']}")
     _debug_log(f"Raw MEMINFO output:\n{mem['output']}")
