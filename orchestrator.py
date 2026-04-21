@@ -44,11 +44,19 @@ def stage_register_new_devices() -> int:
         LOGGER.exception("Device discovery failed: %s", error)
         return 0
 
-    existing = {str(device.get("device_id")) for device in device_registry.get_all_devices()}
+    existing_ids = set()
+    existing_targets = set()
+    for device in device_registry.get_all_devices():
+        existing_id = str(device.get("device_id") or "").strip()
+        if existing_id:
+            existing_ids.add(existing_id)
+        existing_target = adb_reconnect.resolve_target(device)
+        if existing_target:
+            existing_targets.add(existing_target)
     registered_count = 0
 
     for device_id in connected_usb:
-        if device_id in existing:
+        if device_id in existing_ids:
             LOGGER.debug("Device already registered: %s", device_id)
             continue
 
@@ -66,6 +74,11 @@ def stage_register_new_devices() -> int:
             LOGGER.warning("Skipping %s; adb wifi connect failed", device_id)
             continue
 
+        target = f"{ip_address}:{adb_wifi_setup.ADB_PORT}"
+        if target in existing_targets:
+            LOGGER.info("Skipping %s; target already registered as %s", device_id, target)
+            continue
+
         device_name = adb_wifi_setup.get_device_name(device_id)
         try:
             device_registry.add_device(
@@ -78,6 +91,8 @@ def stage_register_new_devices() -> int:
                 }
             )
             registered_count += 1
+            existing_ids.add(device_id)
+            existing_targets.add(target)
         except ValueError as error:
             LOGGER.warning("Could not add %s to registry: %s", device_id, error)
 
