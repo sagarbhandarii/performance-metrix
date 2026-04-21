@@ -1,0 +1,2 @@
+# Current project uses Python standard library only.
+# This file is intentionally minimal for pip workflow compatibility.
