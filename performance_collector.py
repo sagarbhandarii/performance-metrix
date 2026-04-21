@@ -27,7 +27,8 @@ def run_adb(target: str, shell_command: str) -> str:
         check=False,
     )
     if result.returncode != 0:
-        message = (result.stderr or result.stdout or "unknown adb error").strip()
+        details = (result.stderr or result.stdout or "").strip()
+        message = details or f"adb exited with code {result.returncode} for shell command: {shell_command}"
         LOGGER.error("[%s] adb command failed: %s", target, message)
         raise RuntimeError(message)
     return result.stdout
@@ -104,7 +105,7 @@ def parse_fps(gfxinfo_output: str) -> Optional[float]:
 def collect_for_device(target: str, package_name: str, activity_name: str) -> Dict[str, Optional[float]]:
     """Collect all requested metrics for one adb target."""
     LOGGER.info("[%s] Collecting performance metrics", target)
-    top_output = run_adb(target, f"top -n 1 | grep {package_name}")
+    top_output = run_adb(target, "top -n 1")
     meminfo_output = run_adb(target, f"dumpsys meminfo {package_name}")
     start_output = run_adb(target, f"am start -W {package_name}/{activity_name}")
     gfxinfo_output = run_adb(target, f"dumpsys gfxinfo {package_name}")
