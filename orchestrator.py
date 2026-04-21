@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-import adb_reconnect
 import adb_wifi_setup
 import device_registry
 import install_apk_parallel
@@ -31,43 +30,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def stage_connect_devices() -> None:
-    LOGGER.info("Step 1/6: Connect and refresh devices")
-    try:
-        usb_devices = adb_wifi_setup.get_connected_devices()
-    except Exception as error:
-        LOGGER.warning("USB detection failed: %s", error)
-        usb_devices = []
+def _detect_valid_adb_devices() -> List[str]:
+    active_devices = sorted(device_registry.get_active_devices())
+    print(f"Detected active devices ({len(active_devices)}): {active_devices}")
+    LOGGER.info("Detected active devices: %s", active_devices)
+    return active_devices
 
-    known_ids = {str(d.get("device_id", "")).strip() for d in device_registry.get_all_devices()}
 
-    for device_id in usb_devices:
-        if device_id in known_ids:
-            continue
-        if not adb_wifi_setup.enable_tcpip(device_id, adb_wifi_setup.ADB_PORT):
-            continue
-        ip_address = adb_wifi_setup.get_device_ip(device_id)
-        if not ip_address:
-            continue
-        if not adb_wifi_setup.connect_wifi(device_id, ip_address, adb_wifi_setup.ADB_PORT):
+def _sync_registry_with_active_devices(active_devices: List[str]) -> None:
+    device_registry.cleanup_registry(set(active_devices))
+    existing = {str(d.get("device_id", "")).strip() for d in device_registry.get_all_devices()}
+    for device_id in active_devices:
+        if device_id in existing:
+            device_registry.update_device_status(device_id, "available")
             continue
         device_registry.add_device(
             {
                 "device_id": device_id,
-                "ip": ip_address,
+                "ip": "",
                 "port": adb_wifi_setup.ADB_PORT,
                 "status": "available",
                 "device_name": adb_wifi_setup.get_device_name(device_id),
             }
         )
+    LOGGER.info("Registry synced for %d device(s)", len(active_devices))
 
-    for device in device_registry.get_all_devices():
-        target = adb_reconnect.resolve_target(device)
-        device_id = str(device.get("device_id") or target or "unknown")
-        if target and adb_reconnect.reconnect_device(target, adb_reconnect.MAX_RETRIES):
-            device_registry.update_device_status(device_id, "available")
-        else:
-            device_registry.update_device_status(device_id, "offline")
+
+def stage_connect_devices() -> List[str]:
+    LOGGER.info("Step 1/6: Connect and refresh devices")
+    active_devices = _detect_valid_adb_devices()
+    if not active_devices:
+        LOGGER.warning("No active adb devices detected")
+        device_registry.cleanup_registry(set())
+        return []
+
+    _sync_registry_with_active_devices(active_devices)
+    return active_devices
 
 
 def stage_install_apk(apk_path: str, package_name: str, activity_name: str, max_threads: int, timeout: int) -> List[install_apk_parallel.DeviceExecutionStatus]:
@@ -159,8 +157,20 @@ def main() -> None:
     logging_config.setup_logging(args.debug)
     performance_collector.set_debug(args.debug)
 
-    stage_connect_devices()
+    active_devices = stage_connect_devices()
+    if len(active_devices) > 1:
+        LOGGER.warning("More than one active device detected (%d). All will be processed.", len(active_devices))
+    if len(active_devices) == 1:
+        LOGGER.info("Single device connected; strict single-device processing enabled.")
+
     statuses = stage_install_apk(args.apk, args.package, args.activity, args.max_threads, args.timeout)
+    if len(active_devices) == 1 and len(statuses) > 1:
+        LOGGER.warning(
+            "Mismatch detected: one active device but %d status entries. Enforcing strict mapping.",
+            len(statuses),
+        )
+        statuses = [status for status in statuses if status.device_id == active_devices[0]]
+
     results = stage_run_benchmarks(statuses, args.package, args.activity, args.iterations)
     result_file = stage_collect_and_save(results)
     report_file = stage_generate_report(results)

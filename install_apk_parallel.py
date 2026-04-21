@@ -10,6 +10,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import device_registry
@@ -52,9 +53,16 @@ def run_adb_command(
     command: List[str],
     timeout_seconds: int,
     logger: logging.Logger,
+    device_id: str,
 ) -> subprocess.CompletedProcess[str]:
     """Run adb command and raise descriptive errors for common failure modes."""
+    log_path = Path("logs") / f"{device_id.replace(':', '_')}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Running on device: %s", device_id)
     logger.debug("Running command: %s", " ".join(command))
+    with log_path.open("a", encoding="utf-8") as file:
+        file.write(f"Running on device: {device_id}\n")
+        file.write(f"$ {' '.join(command)}\n")
     try:
         result = subprocess.run(
             command,
@@ -107,7 +115,7 @@ def install_and_launch(
     install_success = False
     try:
         logger.info("Installing APK: %s", apk_path)
-        run_adb_command(["adb", "-s", target, "install", "-r", apk_path], timeout_seconds, logger)
+        run_adb_command(["adb", "-s", target, "install", "-r", apk_path], timeout_seconds, logger, device_id)
         install_success = True
 
         component = f"{package_name}/{activity_name}"
@@ -116,6 +124,7 @@ def install_and_launch(
             ["adb", "-s", target, "shell", "am", "start", "-n", component],
             timeout_seconds,
             logger,
+            device_id,
         )
 
         logger.info("Completed successfully")
