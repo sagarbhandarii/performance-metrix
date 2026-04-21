@@ -165,11 +165,13 @@ def _mean_or_default(values: Iterable[float], default: float = 0.0) -> float:
 
 
 def _build_html(rows: Iterable[Dict[str, Any]]) -> str:
-    parsed_rows = [_extract_metrics(r) for r in rows]
+    materialized_rows = list(rows)
+    parsed_rows = [_extract_metrics(r) for r in materialized_rows]
 
     total_devices = len(parsed_rows)
     avg_cpu = _mean_or_default((r[1] for r in parsed_rows), default=0.0)
     avg_mem = _mean_or_default((r[2] for r in parsed_rows), default=0.0)
+    failed_to_fetch = sum(1 for row in materialized_rows if bool(row.get("error")))
 
     table_rows = []
     for device_id, cpu, mem, launch, fps, cpu_label, mem_label, launch_label, fps_label in parsed_rows:
@@ -321,6 +323,10 @@ def _build_html(rows: Iterable[Dict[str, Any]]) -> str:
         <div class="summary-item">
           <div class="summary-label">Average Memory Usage</div>
           <div class="summary-value">{avg_mem:.1f}%</div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">Failed To Fetch</div>
+          <div class="summary-value">{failed_to_fetch}</div>
         </div>
       </div>
     </section>
