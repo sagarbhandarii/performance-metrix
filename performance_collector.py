@@ -219,13 +219,29 @@ def collect_performance_metrics(target: str, package_name: str, activity_name: s
 
 def run_full_benchmark(target: str, package_name: str, activity_name: str, iterations: int = 10) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
-    starts = {
+
+    # Runtime metrics should be captured immediately after launch to reflect active app behavior.
+    _start_app(target, component, timeout=20)
+    runtime = collect_performance_metrics(target, package_name, activity_name)
+
+    startup = {
         "cold": run_start_test(target, "cold", component, package_name, iterations),
         "warm": run_start_test(target, "warm", component, package_name, iterations),
         "hot": run_start_test(target, "hot", component, package_name, iterations),
     }
-    metrics = collect_performance_metrics(target, package_name, activity_name)
-    return {**starts, "metrics": metrics}
+
+    return {
+        "runtime_metrics": {
+            "cpu": runtime.get("cpu_percent", "N/A"),
+            "memory": runtime.get("memory_mb", "N/A"),
+            "fps": runtime.get("fps", "N/A"),
+        },
+        "startup_metrics": startup,
+        "runtime_details": {
+            "launch_time": runtime.get("launch_time", {}),
+            "raw": runtime.get("raw", {}),
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
