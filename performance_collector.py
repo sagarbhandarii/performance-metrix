@@ -11,12 +11,15 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import device_registry
+import logging_config
 
 OUTPUT_FILE = Path(__file__).with_name("performance_results.json")
+LOGGER = logging_config.get_logger("performance_collector")
 
 
 def run_adb(target: str, shell_command: str) -> str:
     """Run an adb shell command for a target and return stdout."""
+    LOGGER.debug("[%s] adb shell %s", target, shell_command)
     result = subprocess.run(
         ["adb", "-s", target, "shell", shell_command],
         capture_output=True,
@@ -25,6 +28,7 @@ def run_adb(target: str, shell_command: str) -> str:
     )
     if result.returncode != 0:
         message = (result.stderr or result.stdout or "unknown adb error").strip()
+        LOGGER.error("[%s] adb command failed: %s", target, message)
         raise RuntimeError(message)
     return result.stdout
 
@@ -99,6 +103,7 @@ def parse_fps(gfxinfo_output: str) -> Optional[float]:
 
 def collect_for_device(target: str, package_name: str, activity_name: str) -> Dict[str, Optional[float]]:
     """Collect all requested metrics for one adb target."""
+    LOGGER.info("[%s] Collecting performance metrics", target)
     top_output = run_adb(target, f"top -n 1 | grep {package_name}")
     meminfo_output = run_adb(target, f"dumpsys meminfo {package_name}")
     start_output = run_adb(target, f"am start -W {package_name}/{activity_name}")
@@ -120,18 +125,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging_config.setup_logging()
     args = parse_args()
     results: Dict[str, Dict[str, Optional[float]]] = {}
 
     for device in get_devices():
         target = build_target(device)
         if not target:
+            LOGGER.error("Skipping device with missing target: %s", device)
             continue
 
         device_id = str(device.get("device_id") or target)
         try:
             results[device_id] = collect_for_device(target, args.package, args.activity)
         except RuntimeError as error:
+            LOGGER.error("[%s] Metrics collection failed: %s", device_id, error)
             results[device_id] = {
                 "cpu": None,
                 "memory": None,
@@ -142,6 +150,7 @@ def main() -> None:
 
     with OUTPUT_FILE.open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2)
+    LOGGER.info("Saved performance results: %s", OUTPUT_FILE)
 
     print(json.dumps(results, indent=2))
 

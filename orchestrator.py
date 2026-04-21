@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 from pathlib import Path
 from typing import Dict, List
 
@@ -13,19 +12,16 @@ import adb_reconnect
 import adb_wifi_setup
 import device_registry
 import install_apk_parallel
+import logging_config
 import performance_collector
 import report_generator
 
-LOGGER = logging.getLogger("orchestrator")
+LOGGER = logging_config.get_logger("orchestrator")
 
 
 def setup_logging(verbose: bool) -> None:
     """Configure logging for orchestration stages."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
-    )
+    logging_config.setup_logging(verbose)
 
 
 def parse_args() -> argparse.Namespace:

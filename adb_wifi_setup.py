@@ -6,14 +6,18 @@ import re
 import subprocess
 from typing import Dict, List, Optional
 
+import logging_config
+
 ADB_PORT = 5555
 OUTPUT_FILE = "devices.json"
+LOGGER = logging_config.get_logger("adb_wifi_setup")
 
 
 def run_command(command: List[str], device_id: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run a command and return the completed process object."""
     prefix = f"[{device_id}] " if device_id else ""
     print(f"{prefix}Running: {' '.join(command)}")
+    LOGGER.debug("%sRunning command: %s", prefix, " ".join(command))
     return subprocess.run(command, capture_output=True, text=True)
 
 
@@ -21,6 +25,7 @@ def get_connected_devices() -> List[str]:
     """Return a list of USB-connected and online device ids from adb devices output."""
     result = run_command(["adb", "devices"])
     if result.returncode != 0:
+        LOGGER.error("Failed to list adb devices: %s", result.stderr.strip())
         raise RuntimeError(f"Failed to list adb devices: {result.stderr.strip()}")
 
     devices: List[str] = []
@@ -37,8 +42,10 @@ def get_connected_devices() -> List[str]:
             devices.append(device_id)
         elif state == "offline":
             print(f"[{device_id}] Skipping: device is offline")
+            LOGGER.error("[%s] Skipping offline device", device_id)
         else:
             print(f"[{device_id}] Skipping: unsupported state '{state}'")
+            LOGGER.error("[%s] Unsupported state '%s'", device_id, state)
 
     return devices
 
@@ -48,9 +55,11 @@ def enable_tcpip(device_id: str, port: int) -> bool:
     result = run_command(["adb", "-s", device_id, "tcpip", str(port)], device_id)
     if result.returncode != 0:
         print(f"[{device_id}] Error enabling tcpip: {result.stderr.strip()}")
+        LOGGER.error("[%s] Error enabling tcpip: %s", device_id, result.stderr.strip())
         return False
 
     print(f"[{device_id}] tcpip enabled: {result.stdout.strip()}")
+    LOGGER.info("[%s] tcpip enabled", device_id)
     return True
 
 
@@ -76,9 +85,11 @@ def get_device_ip(device_id: str) -> Optional[str]:
             octets = [int(part) for part in candidate.split(".")]
             if all(0 <= octet <= 255 for octet in octets):
                 print(f"[{device_id}] Found IP address: {candidate}")
+                LOGGER.info("[%s] Found IP address: %s", device_id, candidate)
                 return candidate
 
     print(f"[{device_id}] Error: no IP address found")
+    LOGGER.error("[%s] No IP address found", device_id)
     return None
 
 
@@ -88,14 +99,17 @@ def connect_wifi(device_id: str, ip_address: str, port: int) -> bool:
     result = run_command(["adb", "connect", target], device_id)
     if result.returncode != 0:
         print(f"[{device_id}] Error connecting to {target}: {result.stderr.strip()}")
+        LOGGER.error("[%s] Error connecting to %s: %s", device_id, target, result.stderr.strip())
         return False
 
     output = result.stdout.strip().lower()
     if "connected" in output or "already connected" in output:
         print(f"[{device_id}] Wi-Fi connect successful: {result.stdout.strip()}")
+        LOGGER.info("[%s] Wi-Fi connect successful: %s", device_id, target)
         return True
 
     print(f"[{device_id}] Unexpected connect output: {result.stdout.strip()}")
+    LOGGER.error("[%s] Unexpected connect output: %s", device_id, result.stdout.strip())
     return False
 
 
@@ -104,33 +118,41 @@ def get_device_name(device_id: str) -> str:
     result = run_command(["adb", "-s", device_id, "shell", "getprop", "ro.product.model"], device_id)
     if result.returncode != 0:
         print(f"[{device_id}] Error getting device name: {result.stderr.strip()}")
+        LOGGER.error("[%s] Error getting device name: %s", device_id, result.stderr.strip())
         return "unknown"
 
     name = result.stdout.strip() or "unknown"
     print(f"[{device_id}] Device name: {name}")
+    LOGGER.info("[%s] Device name: %s", device_id, name)
     return name
 
 
 def main() -> None:
+    logging_config.setup_logging()
     print("Starting ADB USB -> Wi-Fi setup")
+    LOGGER.info("Starting ADB USB -> Wi-Fi setup")
 
     try:
         devices = get_connected_devices()
     except RuntimeError as error:
         print(f"Fatal error: {error}")
+        LOGGER.error("Fatal error: %s", error)
         return
 
     if not devices:
         print("No USB-connected online Android devices found")
+        LOGGER.info("No USB-connected online Android devices found")
         with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
             json.dump([], file, indent=2)
         print(f"Saved empty output to {OUTPUT_FILE}")
+        LOGGER.info("Saved empty output to %s", OUTPUT_FILE)
         return
 
     output: List[Dict[str, object]] = []
 
     for device_id in devices:
         print(f"\nProcessing device: {device_id}")
+        LOGGER.info("Processing device: %s", device_id)
 
         if not enable_tcpip(device_id, ADB_PORT):
             continue
@@ -156,6 +178,7 @@ def main() -> None:
         json.dump(output, file, indent=2)
 
     print(f"\nCompleted. Saved {len(output)} device record(s) to {OUTPUT_FILE}")
+    LOGGER.info("Completed. Saved %d device record(s) to %s", len(output), OUTPUT_FILE)
 
 
 if __name__ == "__main__":

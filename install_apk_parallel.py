@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Optional
 
 import device_registry
+import logging_config
 
 
 @dataclass
@@ -142,11 +143,7 @@ def install_and_launch(
 
 def setup_logging(verbose: bool) -> None:
     """Configure thread-safe console logging."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(threadName)s] [%(name)s] %(levelname)s: %(message)s",
-    )
+    logging_config.setup_logging(verbose)
 
 
 def run_parallel(
