@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Generate HTML reports with locally hosted Chart.js charts."""
+"""Generate a unified single-page HTML performance report with Chart.js charts."""
 
 from __future__ import annotations
 
 import json
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import logging_config
 
@@ -17,6 +17,7 @@ CHART_JS_FILE = STATIC_DIR / "chart.min.js"
 CHART_JS_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
 LOGGER = logging_config.get_logger("report_generator")
 
+# Lightweight fallback when CDN download is unavailable.
 MINI_CHART_JS = """(function(){
 function pick(v,d){return (typeof v==='number'&&isFinite(v))?v:d;}
 function maxIn(ds){var m=0;ds.forEach(function(d){(d.data||[]).forEach(function(v){if(typeof v==='number'&&v>m)m=v;});});return m||1;}
@@ -28,172 +29,299 @@ window.Chart=Chart;
 })();"""
 
 
-def _startup_block(data: Dict[str, Any]) -> Dict[str, Any]:
-    return data.get("startup_metrics", data)
-
-
 def _ensure_local_chart_js() -> None:
-    """Ensure Chart.js is available locally as ./static/chart.min.js."""
+    """Ensure Chart.js exists at ./static/chart.min.js (download, then fallback)."""
     if CHART_JS_FILE.exists() and CHART_JS_FILE.stat().st_size > 0:
         return
 
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
-
     chart_data = b""
+
     try:
         LOGGER.info("Downloading Chart.js to %s", CHART_JS_FILE)
         with urllib.request.urlopen(CHART_JS_URL, timeout=30) as response:
             chart_data = response.read()
-    except Exception as exc:  # network-restricted env fallback
-        LOGGER.warning("Chart.js download failed (%s). Using local fallback renderer.", exc)
+    except Exception as exc:  # pragma: no cover - depends on network access
+        LOGGER.warning("Chart.js download failed (%s). Using fallback renderer.", exc)
 
     if chart_data:
         CHART_JS_FILE.write_bytes(chart_data)
-        return
+    else:
+        CHART_JS_FILE.write_text(MINI_CHART_JS, encoding="utf-8")
 
-    CHART_JS_FILE.write_text(MINI_CHART_JS, encoding="utf-8")
+
+def _fmt_num(value: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "N/A"
 
 
-def _device_sections(results: Dict[str, Any]) -> str:
-    sections = []
-    for idx, (device_id, _) in enumerate(results.items()):
-        bar_id = "barChart" if idx == 0 else f"barChart_{idx}"
-        line_id = "lineChart" if idx == 0 else f"lineChart_{idx}"
-        debug_id = "debug" if idx == 0 else f"debug_{idx}"
-        sections.append(
-            f"""
-  <section class=\"device\"> 
-    <h2>Device: {device_id}</h2>
-    <canvas id=\"{bar_id}\" width=\"400\" height=\"200\"></canvas>
-    <canvas id=\"{line_id}\" width=\"400\" height=\"200\"></canvas>
-    <pre id=\"{debug_id}\"></pre>
-  </section>
-""".rstrip()
+def _as_list(values: Any) -> List[float]:
+    if not isinstance(values, list):
+        return []
+    out: List[float] = []
+    for value in values:
+        try:
+            out.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _metric_value(source: Dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key in source:
+            try:
+                return float(source[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _normalize_results(results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(results, dict):
+        return {}
+    # If data is directly startup_metrics/runtime_metrics without device map, wrap it.
+    if "startup_metrics" in results or "runtime_metrics" in results:
+        return {"Device": results}
+    return {str(device): data for device, data in results.items() if isinstance(data, dict)}
+
+
+def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    runtime_rows: List[Dict[str, Any]] = []
+    startup_rows: List[Dict[str, Any]] = []
+
+    for device, device_data in devices.items():
+        runtime = device_data.get("runtime_metrics", {}) if isinstance(device_data, dict) else {}
+        startup = device_data.get("startup_metrics", {}) if isinstance(device_data, dict) else {}
+
+        runtime_rows.append(
+            {
+                "device": device,
+                "cpu": _metric_value(runtime, "cpu", "cpu_percent", "cpu_usage", "avg_cpu"),
+                "memory": _metric_value(runtime, "memory", "memory_mb", "avg_memory", "memory_usage"),
+                "fps": _metric_value(runtime, "fps", "avg_fps", "frame_rate"),
+            }
         )
 
-    if not sections:
-        return """
-  <section class=\"device\">
-    <h2>No Data Available</h2>
-    <pre id=\"debug\">No Data Available</pre>
-  </section>
-""".rstrip()
+        startup_rows.append(
+            {
+                "device": device,
+                "cold_avg": _metric_value(startup.get("cold", {}), "avg"),
+                "warm_avg": _metric_value(startup.get("warm", {}), "avg"),
+                "hot_avg": _metric_value(startup.get("hot", {}), "avg"),
+                "cold_values": _as_list(startup.get("cold", {}).get("values")),
+                "warm_values": _as_list(startup.get("warm", {}).get("values")),
+                "hot_values": _as_list(startup.get("hot", {}).get("values")),
+            }
+        )
 
-    return "\n".join(sections)
-
-
-def _chart_script(results: Dict[str, Any]) -> str:
-    data_json = json.dumps(results)
-    return f"""
-document.addEventListener("DOMContentLoaded", function () {{
-  console.log("Chart script loaded");
-
-  const allResults = {data_json};
-
-  if (!allResults || Object.keys(allResults).length === 0) {{
-    const body = document.body;
-    const empty = document.createElement('h2');
-    empty.innerText = 'No Data Available';
-    body.appendChild(empty);
-    return;
-  }}
-
-  Object.entries(allResults).forEach(([deviceId, data], idx) => {{
-    console.log("Data:", data);
-
-    const barId = idx === 0 ? 'barChart' : `barChart_${{idx}}`;
-    const lineId = idx === 0 ? 'lineChart' : `lineChart_${{idx}}`;
-    const debugId = idx === 0 ? 'debug' : `debug_${{idx}}`;
-
-    const debugEl = document.getElementById(debugId);
-    if (debugEl) {{
-      debugEl.innerText = JSON.stringify(data, null, 2);
-    }}
-
-    const startup = data.startup_metrics || data;
-    const coldAvg = startup?.cold?.avg ?? 0;
-    const warmAvg = startup?.warm?.avg ?? 0;
-    const hotAvg = startup?.hot?.avg ?? 0;
-
-    const ctx = document.getElementById(barId);
-    if (!ctx) {{
-      console.error("Canvas not found");
-      return;
-    }}
-
-    if (typeof Chart === 'undefined') {{
-      console.error('Chart.js failed to load from local static/chart.min.js');
-      return;
-    }}
-
-    new Chart(ctx, {{
-      type: 'bar',
-      data: {{
-        labels: ['Cold', 'Warm', 'Hot'],
-        datasets: [{{
-          label: 'Launch Time (ms)',
-          data: [coldAvg, warmAvg, hotAvg],
-          backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
-        }}]
-      }},
-      options: {{ responsive: false }}
-    }});
-
-    const coldValues = Array.isArray(startup?.cold?.values) ? startup.cold.values : [];
-    const warmValues = Array.isArray(startup?.warm?.values) ? startup.warm.values : [];
-    const hotValues = Array.isArray(startup?.hot?.values) ? startup.hot.values : [];
-    const maxLen = Math.max(coldValues.length, warmValues.length, hotValues.length, 1);
-    const labels = Array.from({{ length: maxLen }}, (_, i) => i + 1);
-
-    const lineCtx = document.getElementById(lineId);
-    if (!lineCtx) {{
-      console.error("Canvas not found");
-      return;
-    }}
-
-    new Chart(lineCtx, {{
-      type: 'line',
-      data: {{
-        labels: labels,
-        datasets: [
-          {{ label: 'Cold', data: coldValues, borderColor: '#ef4444', fill: false }},
-          {{ label: 'Warm', data: warmValues, borderColor: '#f59e0b', fill: false }},
-          {{ label: 'Hot', data: hotValues, borderColor: '#22c55e', fill: false }}
-        ]
-      }},
-      options: {{ responsive: false }}
-    }});
-  }});
-}});
-""".strip()
+    return runtime_rows, startup_rows
 
 
-def generate_report_from_results(results: Dict[str, Any], output_file: Path = OUTPUT_FILE) -> Path:
-    _ensure_local_chart_js()
-    sections = _device_sections(results)
-    chart_script = _chart_script(results)
+def _avg(values: List[float]) -> float | None:
+    return sum(values) / len(values) if values else None
 
-    html = f"""<!DOCTYPE html>
+
+def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    averages: List[Tuple[str, float]] = []
+    per_device_scores: List[float] = []
+
+    for row in startup_rows:
+        parts = [v for v in [row["cold_avg"], row["warm_avg"], row["hot_avg"]] if isinstance(v, float)]
+        if parts:
+            device_avg = sum(parts) / len(parts)
+            averages.append((row["device"], device_avg))
+            per_device_scores.append(device_avg)
+
+    if not averages:
+        return {
+            "fastest": "N/A",
+            "slowest": "N/A",
+            "overall": "N/A",
+        }
+
+    fastest_device, fastest_value = min(averages, key=lambda x: x[1])
+    slowest_device, slowest_value = max(averages, key=lambda x: x[1])
+    overall = _avg(per_device_scores)
+
+    return {
+        "fastest": f"{fastest_device} ({fastest_value:.2f} ms)",
+        "slowest": f"{slowest_device} ({slowest_value:.2f} ms)",
+        "overall": f"{overall:.2f} ms" if overall is not None else "N/A",
+    }
+
+
+def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "<tr><td colspan=\"4\">No runtime data available</td></tr>"
+    return "\n".join(
+        f"<tr><td>{row['device']}</td><td>{_fmt_num(row['cpu'])}</td><td>{_fmt_num(row['memory'])}</td><td>{_fmt_num(row['fps'])}</td></tr>"
+        for row in rows
+    )
+
+
+def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "<tr><td colspan=\"4\">No startup data available</td></tr>"
+    return "\n".join(
+        f"<tr><td>{row['device']}</td><td>{_fmt_num(row['cold_avg'])}</td><td>{_fmt_num(row['warm_avg'])}</td><td>{_fmt_num(row['hot_avg'])}</td></tr>"
+        for row in rows
+    )
+
+
+def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cold_avg = _avg([row["cold_avg"] for row in startup_rows if isinstance(row["cold_avg"], float)]) or 0.0
+    warm_avg = _avg([row["warm_avg"] for row in startup_rows if isinstance(row["warm_avg"], float)]) or 0.0
+    hot_avg = _avg([row["hot_avg"] for row in startup_rows if isinstance(row["hot_avg"], float)]) or 0.0
+
+    cold_values: List[float] = []
+    warm_values: List[float] = []
+    hot_values: List[float] = []
+    for row in startup_rows:
+        cold_values.extend(row["cold_values"])
+        warm_values.extend(row["warm_values"])
+        hot_values.extend(row["hot_values"])
+
+    def _pad(values: List[float], target: int = 10) -> List[float]:
+        trimmed = values[:target]
+        if len(trimmed) < target:
+            trimmed.extend([0.0] * (target - len(trimmed)))
+        return trimmed
+
+    return {
+        "startup_metrics": {
+            "cold": {"avg": round(cold_avg, 2), "values": _pad(cold_values)},
+            "warm": {"avg": round(warm_avg, 2), "values": _pad(warm_values)},
+            "hot": {"avg": round(hot_avg, 2), "values": _pad(hot_values)},
+        }
+    }
+
+
+def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, chart_data_json: str) -> str:
+    return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
   <meta charset=\"UTF-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
-  <title>Android Performance Report</title>
+  <title>Unified Android Performance Report</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-    canvas {{ border: 1px solid #ddd; margin-bottom: 16px; display: block; }}
-    pre {{ background: #f7f7f7; border: 1px solid #ddd; padding: 10px; overflow: auto; }}
+    body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2937; }}
+    h1 {{ margin-bottom: 24px; }}
+    section {{ margin-bottom: 28px; padding: 16px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+    th, td {{ border: 1px solid #d1d5db; padding: 8px 10px; text-align: left; }}
+    th {{ background: #f3f4f6; }}
+    .chart-wrap {{ max-width: 900px; margin: 0 auto 20px auto; }}
+    canvas {{ width: 100%; max-width: 900px; height: 360px; border: 1px solid #e5e7eb; border-radius: 6px; background: #fafafa; margin: 12px auto; display: block; }}
   </style>
 </head>
 <body>
-{sections}
+<h1>Unified Android Performance Report</h1>
+
+<section>
+  <h2>Summary</h2>
+  <p>Fastest Device: {summary['fastest']}</p>
+  <p>Slowest Device: {summary['slowest']}</p>
+  <p>Overall Average: {summary['overall']}</p>
+</section>
+
+<section>
+  <h2>Runtime Performance</h2>
+  <table>
+    <tr>
+      <th>Device</th>
+      <th>CPU %</th>
+      <th>Memory (MB)</th>
+      <th>FPS</th>
+    </tr>
+    {runtime_rows}
+  </table>
+</section>
+
+<section>
+  <h2>Startup Performance</h2>
+  <table>
+    <tr>
+      <th>Device</th>
+      <th>Cold Avg</th>
+      <th>Warm Avg</th>
+      <th>Hot Avg</th>
+    </tr>
+    {startup_rows}
+  </table>
+</section>
+
+<section>
+  <h2>Performance Charts</h2>
+  <div class=\"chart-wrap\">
+    <canvas id=\"barChart\"></canvas>
+    <canvas id=\"lineChart\"></canvas>
+  </div>
+</section>
+
 <script src=\"static/chart.min.js\"></script>
 <script>
-{chart_script}
-</script>
-</body>
-</html>"""
+document.addEventListener(\"DOMContentLoaded\", function () {{
+  const data = {chart_data_json};
 
+  const ctx = document.getElementById(\"barChart\");
+  const ctx2 = document.getElementById(\"lineChart\");
+
+  if (!ctx || !ctx2 || typeof Chart === 'undefined') {{
+    return;
+  }}
+
+  new Chart(ctx, {{
+    type: 'bar',
+    data: {{
+      labels: ['Cold','Warm','Hot'],
+      datasets: [{{
+        label: 'Avg Launch Time',
+        data: [
+          data.startup_metrics.cold.avg,
+          data.startup_metrics.warm.avg,
+          data.startup_metrics.hot.avg
+        ],
+        backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
+      }}]
+    }},
+    options: {{ responsive: true, maintainAspectRatio: false }}
+  }});
+
+  new Chart(ctx2, {{
+    type: 'line',
+    data: {{
+      labels: [1,2,3,4,5,6,7,8,9,10],
+      datasets: [
+        {{ label: 'Cold', data: data.startup_metrics.cold.values, borderColor: '#ef4444', fill: false }},
+        {{ label: 'Warm', data: data.startup_metrics.warm.values, borderColor: '#f59e0b', fill: false }},
+        {{ label: 'Hot', data: data.startup_metrics.hot.values, borderColor: '#22c55e', fill: false }}
+      ]
+    }},
+    options: {{ responsive: true, maintainAspectRatio: false }}
+  }});
+}});
+</script>
+
+</body>
+</html>
+"""
+
+
+def generate_report_from_results(results: Dict[str, Any], output_file: Path = OUTPUT_FILE) -> Path:
+    _ensure_local_chart_js()
+
+    devices = _normalize_results(results)
+    runtime_data, startup_data = _collect_rows(devices)
+
+    summary = _build_summary(startup_data)
+    runtime_rows = _runtime_rows_html(runtime_data)
+    startup_rows = _startup_rows_html(startup_data)
+    chart_data_json = json.dumps(_chart_payload(startup_data))
+
+    html = _html_report(summary, runtime_rows, startup_rows, chart_data_json)
     output_file.write_text(html, encoding="utf-8")
     LOGGER.info("Report generated: %s", output_file)
     return output_file
