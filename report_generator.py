@@ -1,379 +1,186 @@
 #!/usr/bin/env python3
-"""Generate an HTML performance report from performance_results.json."""
+"""Generate responsive HTML reports for launch benchmarks."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import logging_config
 
-INPUT_FILE = Path("performance_results.json")
+INPUT_FILE = Path("final_results.json")
 OUTPUT_FILE = Path("report.html")
 LOGGER = logging_config.get_logger("report_generator")
 
 
-def _to_float(value: Any, default: float = 0.0) -> float:
-    """Best-effort conversion to float.
-
-    Supports numbers and strings such as "72", "72%", "512 MB", "1.5s".
-    """
-    if value is None:
-        return default
-
+def _to_number(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
-
-    if isinstance(value, str):
-        cleaned = value.strip()
-        for token in ["%", "mb", "mib", "gb", "s", "sec", "seconds", "ms"]:
-            cleaned = cleaned.replace(token, "", 1) if cleaned.lower().endswith(token) else cleaned
-        try:
-            return float(cleaned)
-        except ValueError:
-            return default
-
-    return default
+    return None
 
 
-def _pick(item: Dict[str, Any], *keys: str, default: Any = None) -> Any:
-    for key in keys:
-        if key in item and item[key] is not None:
-            return item[key]
-    return default
+def _device_avg(device_data: Dict[str, Any]) -> float | None:
+    values = []
+    for phase in ("cold", "warm", "hot"):
+        avg = _to_number(device_data.get(phase, {}).get("avg"))
+        if avg is not None:
+            values.append(avg)
+    return round(mean(values), 2) if values else None
 
 
-def _normalize_records(data: Any) -> List[Dict[str, Any]]:
-    """Normalize possible JSON shapes into a list of device records."""
-    if isinstance(data, list):
-        LOGGER.debug("Normalizing list-shaped data (%d records)", len(data))
-        return [entry for entry in data if isinstance(entry, dict)]
+def _compute_summary(results: Dict[str, Any]) -> Dict[str, Any]:
+    device_scores: List[Tuple[str, float]] = []
+    all_values: List[float] = []
 
-    if isinstance(data, dict):
-        if isinstance(data.get("devices"), list):
-            LOGGER.debug("Normalizing `devices` section")
-            return [entry for entry in data["devices"] if isinstance(entry, dict)]
+    for device_id, data in results.items():
+        device_avg = _device_avg(data)
+        if device_avg is not None:
+            device_scores.append((device_id, device_avg))
+        for phase in ("cold", "warm", "hot"):
+            all_values.extend([float(v) for v in data.get(phase, {}).get("values", []) if isinstance(v, (int, float))])
 
-        if isinstance(data.get("results"), list):
-            LOGGER.debug("Normalizing `results` section")
-            return [entry for entry in data["results"] if isinstance(entry, dict)]
-
-        # Shape: {"device1": {...}, "device2": {...}}
-        if all(isinstance(v, dict) for v in data.values()):
-            normalized: List[Dict[str, Any]] = []
-            for device_id, metrics in data.items():
-                row = dict(metrics)
-                row.setdefault("device_id", device_id)
-                normalized.append(row)
-            return normalized
-
-    LOGGER.error("Unsupported report input shape")
-    return []
+    fastest = min(device_scores, key=lambda x: x[1])[0] if device_scores else "N/A"
+    slowest = max(device_scores, key=lambda x: x[1])[0] if device_scores else "N/A"
+    overall_avg = round(mean(all_values), 2) if all_values else "N/A"
+    return {"fastest": fastest, "slowest": slowest, "overall_avg": overall_avg}
 
 
-def _cpu_class(cpu: float) -> str:
-    if cpu < 60:
-        return "good"
-    if cpu < 85:
-        return "warning"
-    return "critical"
+def _build_table_rows(results: Dict[str, Any]) -> str:
+    rows = []
+    for device_id, data in results.items():
+        cold = data.get("cold", {}).get("avg", "N/A")
+        warm = data.get("warm", {}).get("avg", "N/A")
+        hot = data.get("hot", {}).get("avg", "N/A")
+        rows.append(
+            f"<tr><td>{device_id}</td><td>{cold}</td><td>{warm}</td><td>{hot}</td></tr>"
+        )
+    return "\n".join(rows) if rows else "<tr><td colspan='4'>No results</td></tr>"
 
 
-def _mem_class(mem: float) -> str:
-    if mem < 60:
-        return "good"
-    if mem < 85:
-        return "warning"
-    return "critical"
-
-
-def _launch_class(launch: float) -> str:
-    if launch < 2.5:
-        return "good"
-    if launch < 4.0:
-        return "warning"
-    return "critical"
-
-
-def _fps_class(fps: float) -> str:
-    if fps >= 55:
-        return "good"
-    if fps >= 40:
-        return "warning"
-    return "critical"
-
-
-def _as_percent_or_raw(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    numeric = _to_float(value)
-    return f"{numeric:.1f}%"
-
-
-def _as_memory_or_raw(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    numeric = _to_float(value)
-    return f"{numeric:.1f}%"
-
-
-def _as_launch_or_raw(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    numeric = _to_float(value)
-    return f"{numeric:.2f}s"
-
-
-def _as_fps_or_raw(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    numeric = _to_float(value)
-    return f"{numeric:.1f}"
-
-
-def _extract_metrics(record: Dict[str, Any]) -> Tuple[str, float, float, float, float, str, str, str, str]:
-    device_id = str(_pick(record, "device_id", "id", "device", "serial", default="Unknown"))
-
-    cpu_raw = _pick(record, "cpu_usage", "cpu", "cpu_percent", default=0)
-    mem_raw = _pick(record, "memory_usage", "memory", "mem", "memory_percent", default=0)
-    launch_raw = _pick(record, "launch_time", "startup_time", "app_launch_time", default=0)
-    fps_raw = _pick(record, "fps", "frame_rate", default=0)
-
-    cpu = _to_float(cpu_raw)
-    mem = _to_float(mem_raw)
-    launch = _to_float(launch_raw)
-    fps = _to_float(fps_raw)
-
-    return (
-        device_id,
-        cpu,
-        mem,
-        launch,
-        fps,
-        _as_percent_or_raw(cpu_raw),
-        _as_memory_or_raw(mem_raw),
-        _as_launch_or_raw(launch_raw),
-        _as_fps_or_raw(fps_raw),
-    )
-
-
-def _mean_or_default(values: Iterable[float], default: float = 0.0) -> float:
-    materialized = list(values)
-    return mean(materialized) if materialized else default
-
-
-def _build_html(rows: Iterable[Dict[str, Any]]) -> str:
-    materialized_rows = list(rows)
-    parsed_rows = [_extract_metrics(r) for r in materialized_rows]
-
-    total_devices = len(parsed_rows)
-    avg_cpu = _mean_or_default((r[1] for r in parsed_rows), default=0.0)
-    avg_mem = _mean_or_default((r[2] for r in parsed_rows), default=0.0)
-    failed_to_fetch = sum(1 for row in materialized_rows if bool(row.get("error")))
-
-    table_rows = []
-    for device_id, cpu, mem, launch, fps, cpu_label, mem_label, launch_label, fps_label in parsed_rows:
-        table_rows.append(
+def _build_device_cards(results: Dict[str, Any]) -> str:
+    cards = []
+    for index, (device_id, data) in enumerate(results.items()):
+        cards.append(
             f"""
-            <tr>
-              <td>{device_id}</td>
-              <td class=\"{_cpu_class(cpu)}\">{cpu_label}</td>
-              <td class=\"{_mem_class(mem)}\">{mem_label}</td>
-              <td class=\"{_launch_class(launch)}\">{launch_label}</td>
-              <td class=\"{_fps_class(fps)}\">{fps_label}</td>
-            </tr>
+            <section class=\"card\">
+              <h3>{device_id}</h3>
+              <div class=\"charts\">
+                <canvas id=\"bar_{index}\"></canvas>
+                <canvas id=\"line_{index}\"></canvas>
+              </div>
+            </section>
             """.strip()
         )
+    return "\n".join(cards)
 
-    rows_html = "\n".join(table_rows) if table_rows else '<tr><td colspan="5">No device results found.</td></tr>'
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
+def _build_chart_script(results: Dict[str, Any]) -> str:
+    data_json = json.dumps(results)
+    return f"""
+    const reportData = {data_json};
+    Object.entries(reportData).forEach(([deviceId, data], idx) => {{
+      const coldAvg = typeof data.cold?.avg === 'number' ? data.cold.avg : null;
+      const warmAvg = typeof data.warm?.avg === 'number' ? data.warm.avg : null;
+      const hotAvg = typeof data.hot?.avg === 'number' ? data.hot.avg : null;
+
+      new Chart(document.getElementById(`bar_${{idx}}`), {{
+        type: 'bar',
+        data: {{
+          labels: ['Cold', 'Warm', 'Hot'],
+          datasets: [{{
+            label: `${{deviceId}} Average Launch (ms)`,
+            data: [coldAvg, warmAvg, hotAvg],
+            backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
+          }}]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false }}
+      }});
+
+      const coldValues = Array.isArray(data.cold?.values) ? data.cold.values : [];
+      const warmValues = Array.isArray(data.warm?.values) ? data.warm.values : [];
+      const hotValues = Array.isArray(data.hot?.values) ? data.hot.values : [];
+      const iterations = Math.max(coldValues.length, warmValues.length, hotValues.length, 10);
+      const labels = Array.from({{length: iterations}}, (_, i) => i + 1);
+
+      new Chart(document.getElementById(`line_${{idx}}`), {{
+        type: 'line',
+        data: {{
+          labels,
+          datasets: [
+            {{ label: 'Cold', data: coldValues, borderColor: '#ef4444', fill: false }},
+            {{ label: 'Warm', data: warmValues, borderColor: '#f59e0b', fill: false }},
+            {{ label: 'Hot', data: hotValues, borderColor: '#22c55e', fill: false }}
+          ]
+        }},
+        options: {{ responsive: true, maintainAspectRatio: false }}
+      }});
+    }});
+    """
+
+
+def generate_report_from_results(results: Dict[str, Any], output_file: Path = OUTPUT_FILE) -> Path:
+    summary = _compute_summary(results)
+    table_rows = _build_table_rows(results)
+    device_cards = _build_device_cards(results)
+    charts_script = _build_chart_script(results)
+
+    html = f"""<!DOCTYPE html>
+<html lang=\"en\">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Performance Report</title>
+  <meta charset=\"UTF-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
+  <title>Android Performance Report</title>
+  <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>
   <style>
-    :root {{
-      --good-bg: #e8f7ec;
-      --good-txt: #1e7e34;
-      --warn-bg: #fff8e1;
-      --warn-txt: #8a6d3b;
-      --crit-bg: #fdeaea;
-      --crit-txt: #a94442;
-      --card-bg: #ffffff;
-      --page-bg: #f3f5f8;
-      --border: #d9dee7;
-      --text: #1e293b;
-    }}
-
-    * {{ box-sizing: border-box; }}
-
-    body {{
-      margin: 0;
-      padding: 24px;
-      background: var(--page-bg);
-      color: var(--text);
-      font-family: Inter, Segoe UI, Roboto, Arial, sans-serif;
-      line-height: 1.4;
-    }}
-
-    .container {{
-      max-width: 980px;
-      margin: 0 auto;
-      display: grid;
-      gap: 18px;
-    }}
-
-    .card {{
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
-      padding: 18px;
-    }}
-
-    h1, h2 {{ margin-top: 0; }}
-
-    .summary-grid {{
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    }}
-
-    .summary-item {{
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 12px;
-      background: #fbfcfe;
-    }}
-
-    .summary-label {{
-      font-size: 0.85rem;
-      color: #475569;
-      margin-bottom: 6px;
-    }}
-
-    .summary-value {{
-      font-size: 1.35rem;
-      font-weight: 700;
-    }}
-
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      overflow: hidden;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-    }}
-
-    th, td {{
-      padding: 12px;
-      border-bottom: 1px solid var(--border);
-      text-align: left;
-      vertical-align: middle;
-    }}
-
-    th {{
-      background: #eef2f7;
-      font-weight: 600;
-      color: #334155;
-    }}
-
-    tr:last-child td {{ border-bottom: none; }}
-
-    .good {{ background: var(--good-bg); color: var(--good-txt); font-weight: 600; }}
-    .warning {{ background: var(--warn-bg); color: var(--warn-txt); font-weight: 600; }}
-    .critical {{ background: var(--crit-bg); color: var(--crit-txt); font-weight: 600; }}
-
-    .legend {{
-      margin-top: 12px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      font-size: 0.9rem;
-    }}
-
-    .badge {{
-      border-radius: 999px;
-      padding: 4px 10px;
-      border: 1px solid transparent;
-    }}
-
-    .good.badge {{ border-color: #9ad6a5; }}
-    .warning.badge {{ border-color: #f0dca3; }}
-    .critical.badge {{ border-color: #f2b9b8; }}
+    body {{ font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #111827; }}
+    .container {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+    .card {{ background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 8px rgba(0,0,0,.08); }}
+    .summary {{ display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }}
+    .charts {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+    canvas {{ background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; min-height: 280px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; }}
+    @media (max-width: 920px) {{ .charts {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
-  <div class="container">
-    <section class="card">
-      <h1>Performance Report</h1>
-      <div class="summary-grid">
-        <div class="summary-item">
-          <div class="summary-label">Total Devices</div>
-          <div class="summary-value">{total_devices}</div>
-        </div>
-        <div class="summary-item">
-          <div class="summary-label">Average CPU Usage</div>
-          <div class="summary-value">{avg_cpu:.1f}%</div>
-        </div>
-        <div class="summary-item">
-          <div class="summary-label">Average Memory Usage</div>
-          <div class="summary-value">{avg_mem:.1f}%</div>
-        </div>
-        <div class="summary-item">
-          <div class="summary-label">Failed To Fetch</div>
-          <div class="summary-value">{failed_to_fetch}</div>
-        </div>
+  <div class=\"container\">
+    <section class=\"card\">
+      <h1>Android Launch Benchmark Report</h1>
+      <div class=\"summary\">
+        <div class=\"card\"><strong>Fastest Device</strong><br/>{summary['fastest']}</div>
+        <div class=\"card\"><strong>Slowest Device</strong><br/>{summary['slowest']}</div>
+        <div class=\"card\"><strong>Overall Average (ms)</strong><br/>{summary['overall_avg']}</div>
       </div>
     </section>
 
-    <section class="card">
-      <h2>Device Metrics</h2>
+    <section class=\"card\">
+      <h2>Device Summary Table</h2>
       <table>
-        <thead>
-          <tr>
-            <th>Device ID</th>
-            <th>CPU Usage</th>
-            <th>Memory Usage</th>
-            <th>Launch Time</th>
-            <th>FPS</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows_html}
-        </tbody>
+        <thead><tr><th>Device</th><th>Cold Avg</th><th>Warm Avg</th><th>Hot Avg</th></tr></thead>
+        <tbody>{table_rows}</tbody>
       </table>
-      <div class="legend">
-        <span class="badge good">Green = Good</span>
-        <span class="badge warning">Yellow = Warning</span>
-        <span class="badge critical">Red = Critical</span>
-      </div>
     </section>
+
+    {device_cards}
   </div>
+  <script>{charts_script}</script>
 </body>
-</html>
-"""
+</html>"""
+
+    output_file.write_text(html, encoding="utf-8")
+    LOGGER.info("Report generated: %s", output_file)
+    return output_file
 
 
 def main() -> None:
-    logging_config.setup_logging()
+    logging_config.setup_logging(False)
     if not INPUT_FILE.exists():
-        LOGGER.error("Input file not found: %s", INPUT_FILE)
-        raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
-
-    with INPUT_FILE.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    rows = _normalize_records(data)
-    html = _build_html(rows)
-
-    OUTPUT_FILE.write_text(html, encoding="utf-8")
-    LOGGER.info("Report generated: %s", OUTPUT_FILE)
-    print(f"Report generated: {OUTPUT_FILE}")
+        raise FileNotFoundError(f"Missing input JSON: {INPUT_FILE}")
+    results = json.loads(INPUT_FILE.read_text(encoding="utf-8"))
+    generate_report_from_results(results, OUTPUT_FILE)
 
 
 if __name__ == "__main__":
