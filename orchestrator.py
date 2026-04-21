@@ -92,17 +92,20 @@ def stage_run_benchmarks(
     activity_name: str,
     iterations: int,
 ) -> Dict[str, Any]:
-    LOGGER.info("Step 3/6: Run cold/warm/hot benchmarks")
+    LOGGER.info("Step 3/6: Run runtime + startup benchmarks")
     results: Dict[str, Any] = {}
 
     for status in statuses:
         device_id = status.device_id
         if status.status != "success":
             results[device_id] = {
-                "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "metrics": {},
+                "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
+                "startup_metrics": {
+                    "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                    "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                    "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                },
+                "runtime_details": {"launch_time": {}, "raw": {}},
                 "error": status.error or "install/launch failed",
             }
             continue
@@ -116,10 +119,13 @@ def stage_run_benchmarks(
             )
         except Exception as error:
             results[device_id] = {
-                "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "metrics": {},
+                "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
+                "startup_metrics": {
+                    "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                    "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                    "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                },
+                "runtime_details": {"launch_time": {}, "raw": {}},
                 "error": str(error),
             }
 
