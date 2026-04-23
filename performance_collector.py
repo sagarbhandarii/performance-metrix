@@ -22,6 +22,8 @@ LOGGER = logging_config.get_logger("performance_collector")
 DEBUG_MODE = False
 
 MetricValue = Union[float, str]
+RUNTIME_OBSERVATION_WINDOW_SECONDS = 60
+CPU_SAMPLE_INTERVAL_SECONDS = 5
 
 
 def set_debug(enabled: bool) -> None:
@@ -237,6 +239,37 @@ def collect_gc_count(target: str, package_name: str) -> int:
     return total
 
 
+def collect_cpu_average(
+    target: str,
+    package_name: str,
+    duration_seconds: int = RUNTIME_OBSERVATION_WINDOW_SECONDS,
+    interval_seconds: int = CPU_SAMPLE_INTERVAL_SECONDS,
+) -> MetricValue:
+    samples: List[float] = []
+    deadline = time.time() + max(1, duration_seconds)
+    while time.time() < deadline:
+        top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
+        cpu = parse_cpu_usage(top["output"], package_name) if top["success"] else "N/A"
+        if cpu == "N/A":
+            cpuinfo = run_adb_command(
+                ["adb", "-s", target, "shell", "dumpsys", "cpuinfo", package_name],
+                timeout=15,
+                device_id=target,
+            )
+            if cpuinfo["success"]:
+                cpu = parse_cpu_usage_cpuinfo(cpuinfo["output"], package_name)
+        if isinstance(cpu, float):
+            samples.append(cpu)
+            _debug_log(f"[{target}] CPU sample: {cpu}%")
+        time.sleep(max(1, interval_seconds))
+
+    if not samples:
+        return "N/A"
+    avg_cpu = round(mean(samples), 2)
+    _debug_log(f"[{target}] Average CPU over {duration_seconds}s: {avg_cpu}%")
+    return avg_cpu
+
+
 def _start_app(target: str, component: str, timeout: int = 20) -> Dict[str, Any]:
     return run_adb_command(["adb", "-s", target, "shell", "am", "start", "-W", "-n", component], timeout=timeout, device_id=target)
 
@@ -275,9 +308,18 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
     return {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"}
 
 
-def collect_performance_metrics(target: str, package_name: str, activity_name: str) -> Dict[str, Any]:
+def collect_performance_metrics(
+    target: str,
+    package_name: str,
+    activity_name: str,
+    launch_before_collect: bool = True,
+) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
-    launch = _start_app(target, component, timeout=20)
+    launch: Dict[str, Any]
+    if launch_before_collect:
+        launch = _start_app(target, component, timeout=20)
+    else:
+        launch = {"success": True, "output": "", "error": ""}
 
     top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
     cpuinfo = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "cpuinfo", package_name], timeout=15, device_id=target)
@@ -318,20 +360,26 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     # Keep only benchmark-time logs so GC count is scoped to this run.
     run_adb_command(["adb", "-s", target, "logcat", "-c"], timeout=10, device_id=target)
 
-    # Runtime metrics should be captured immediately after launch to reflect active app behavior.
+    # Launch app once and keep it running while runtime metrics are observed.
     _start_app(target, component, timeout=20)
-    runtime = collect_performance_metrics(target, package_name, activity_name)
+    avg_cpu = collect_cpu_average(
+        target,
+        package_name,
+        duration_seconds=RUNTIME_OBSERVATION_WINDOW_SECONDS,
+        interval_seconds=CPU_SAMPLE_INTERVAL_SECONDS,
+    )
+    runtime = collect_performance_metrics(target, package_name, activity_name, launch_before_collect=False)
+    gc_count = collect_gc_count(target, package_name)
 
     startup = {
         "cold": run_start_test(target, "cold", component, package_name, iterations),
         "warm": run_start_test(target, "warm", component, package_name, iterations),
         "hot": run_start_test(target, "hot", component, package_name, iterations),
     }
-    gc_count = collect_gc_count(target, package_name)
 
     return {
         "runtime_metrics": {
-            "cpu": runtime.get("cpu_percent", "N/A"),
+            "cpu": avg_cpu,
             "memory": runtime.get("memory_mb", "N/A"),
             "fps": runtime.get("fps", "N/A"),
             "gc_count": gc_count,
