@@ -127,10 +127,17 @@ def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
 
 
 def parse_cpu_usage_cpuinfo(cpuinfo_output: str, package_name: str) -> MetricValue:
+    escaped_pkg = re.escape(package_name)
     for line in cpuinfo_output.splitlines():
         if package_name not in line:
             continue
-        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", line)
+        # dumpsys cpuinfo frequently renders lines like:
+        # "6.1% 1234/com.example.app: 4.2% user + 1.9% kernel"
+        # so parse the leading process value first.
+        match = re.search(rf"^\s*([0-9]+(?:\.[0-9]+)?)%\s+\d+/{escaped_pkg}(?::\S+)?\b", line)
+        if not match:
+            # Fallback: parse the first percentage on package-containing lines.
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", line)
         if match:
             value = float(match.group(1))
             _debug_log(f"Parsed CPU from cpuinfo line: {line} => {value}")
@@ -193,24 +200,37 @@ def _get_package_pids(target: str, package_name: str) -> List[str]:
 def collect_gc_count(target: str, package_name: str) -> int:
     pids = set(_get_package_pids(target, package_name))
     logcat = run_adb_command(
-        ["adb", "-s", target, "logcat", "-d", "-v", "brief", "art:I", "*:S"],
+        ["adb", "-s", target, "logcat", "-d", "-v", "threadtime"],
         timeout=20,
         device_id=target,
     )
     if not logcat["success"] or not logcat["output"]:
         return 0
 
-    gc_keywords = ("GC", "GC freed", "Explicit concurrent mark sweep GC")
+    gc_keywords = (
+        "GC",
+        "GC freed",
+        "concurrent mark sweep",
+        "concurrent copying",
+        "young concurrent copying",
+        "Background concurrent",
+    )
+    package_process_prefix = f"{package_name}:"
     total = 0
     for line in logcat["output"].splitlines():
         if not any(keyword in line for keyword in gc_keywords):
             continue
-        pid_match = re.search(r"\bart\((\d+)\)", line)
-        if not pids:
-            # If pid resolution is unavailable, include all ART GC occurrences.
+        pid_match = re.search(r"^\S+\s+\S+\s+(\d+)\s+\d+\s+[A-Z]\s+\S+\s*:", line)
+        pid = pid_match.group(1) if pid_match else None
+        if pid and pid in pids:
             total += 1
             continue
-        if pid_match and pid_match.group(1) in pids:
+
+        # Fallbacks for devices where PID matching is unreliable across app restarts.
+        if package_name in line or package_process_prefix in line:
+            total += 1
+            continue
+        if not pids:
             total += 1
 
     _debug_log(f"[{target}] GC count for {package_name}: {total}")
@@ -257,11 +277,11 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
 
 def collect_performance_metrics(target: str, package_name: str, activity_name: str) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
+    launch = _start_app(target, component, timeout=20)
 
     top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
     cpuinfo = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "cpuinfo", package_name], timeout=15, device_id=target)
     mem = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "meminfo", package_name], timeout=15, device_id=target)
-    launch = _start_app(target, component, timeout=20)
     gfx = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "gfxinfo", package_name], timeout=20, device_id=target)
 
     _debug_log(f"Raw TOP output:\n{top['output']}")
