@@ -102,6 +102,7 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
                 "cpu": _metric_value(runtime, "cpu", "cpu_percent", "cpu_usage", "avg_cpu"),
                 "memory": _metric_value(runtime, "memory", "memory_mb", "avg_memory", "memory_usage"),
                 "fps": _metric_value(runtime, "fps", "avg_fps", "frame_rate"),
+                "gc_count": _metric_value(runtime, "gc_count"),
             }
         )
 
@@ -155,7 +156,7 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
 
 def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "<tr><td colspan=\"4\">No runtime data available</td></tr>"
+        return "<tr><td colspan=\"5\">No runtime data available</td></tr>"
 
     def _perf_class_cpu(cpu: float | None) -> str:
         if not isinstance(cpu, float):
@@ -183,6 +184,7 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
             f"<td class=\"{_perf_class_cpu(row['cpu'])}\">{_fmt_num(row['cpu'])}</td>"
             f"<td>{_fmt_num(row['memory'])}</td>"
             f"<td class=\"{_perf_class_fps(row['fps'])}\">{_fmt_num(row['fps'])}</td>"
+            f"<td>{_fmt_num(row['gc_count'], 0)}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
@@ -404,6 +406,7 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       <th>CPU %</th>
       <th>Memory (MB)</th>
       <th>FPS</th>
+      <th>GC Count</th>
     </tr>
     {runtime_rows}
   </table>

@@ -115,10 +115,25 @@ def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
     for line in top_output.splitlines():
         if package_name not in line:
             continue
-        match = re.search(r"(\d+(?:\.\d+)?)%", line)
+        match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        if not match:
+            # Some Android builds return CPU as a bare number in top output.
+            match = re.search(r"\b(\d+(?:\.\d+)?)\b", line)
         if match:
             value = float(match.group(1))
             _debug_log(f"Parsed CPU from line: {line} => {value}")
+            return value
+    return "N/A"
+
+
+def parse_cpu_usage_cpuinfo(cpuinfo_output: str, package_name: str) -> MetricValue:
+    for line in cpuinfo_output.splitlines():
+        if package_name not in line:
+            continue
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", line)
+        if match:
+            value = float(match.group(1))
+            _debug_log(f"Parsed CPU from cpuinfo line: {line} => {value}")
             return value
     return "N/A"
 
@@ -168,6 +183,40 @@ def parse_fps(gfxinfo_output: str) -> MetricValue:
     return "N/A"
 
 
+def _get_package_pids(target: str, package_name: str) -> List[str]:
+    result = run_adb_command(["adb", "-s", target, "shell", "pidof", package_name], timeout=10, device_id=target)
+    if not result["success"] or not result["output"]:
+        return []
+    return [pid for pid in result["output"].split() if pid.isdigit()]
+
+
+def collect_gc_count(target: str, package_name: str) -> int:
+    pids = set(_get_package_pids(target, package_name))
+    logcat = run_adb_command(
+        ["adb", "-s", target, "logcat", "-d", "-v", "brief", "art:I", "*:S"],
+        timeout=20,
+        device_id=target,
+    )
+    if not logcat["success"] or not logcat["output"]:
+        return 0
+
+    gc_keywords = ("GC", "GC freed", "Explicit concurrent mark sweep GC")
+    total = 0
+    for line in logcat["output"].splitlines():
+        if not any(keyword in line for keyword in gc_keywords):
+            continue
+        pid_match = re.search(r"\bart\((\d+)\)", line)
+        if not pids:
+            # If pid resolution is unavailable, include all ART GC occurrences.
+            total += 1
+            continue
+        if pid_match and pid_match.group(1) in pids:
+            total += 1
+
+    _debug_log(f"[{target}] GC count for {package_name}: {total}")
+    return total
+
+
 def _start_app(target: str, component: str, timeout: int = 20) -> Dict[str, Any]:
     return run_adb_command(["adb", "-s", target, "shell", "am", "start", "-W", "-n", component], timeout=timeout, device_id=target)
 
@@ -210,16 +259,20 @@ def collect_performance_metrics(target: str, package_name: str, activity_name: s
     component = f"{package_name}/{activity_name}"
 
     top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
+    cpuinfo = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "cpuinfo", package_name], timeout=15, device_id=target)
     mem = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "meminfo", package_name], timeout=15, device_id=target)
     launch = _start_app(target, component, timeout=20)
     gfx = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "gfxinfo", package_name], timeout=20, device_id=target)
 
     _debug_log(f"Raw TOP output:\n{top['output']}")
+    _debug_log(f"Raw CPUINFO output:\n{cpuinfo['output']}")
     _debug_log(f"Raw MEMINFO output:\n{mem['output']}")
     _debug_log(f"Raw START output:\n{launch['output']}")
     _debug_log(f"Raw GFXINFO output:\n{gfx['output']}")
 
     cpu = parse_cpu_usage(top["output"], package_name) if top["success"] else "N/A"
+    if cpu == "N/A" and cpuinfo["success"]:
+        cpu = parse_cpu_usage_cpuinfo(cpuinfo["output"], package_name)
     memory = parse_memory_mb(mem["output"]) if mem["success"] else "N/A"
     launch_times = parse_launch_times(launch["output"]) if launch["success"] else {"ThisTime": "N/A", "TotalTime": "N/A", "WaitTime": "N/A"}
     fps = parse_fps(gfx["output"]) if gfx["success"] else "N/A"
@@ -231,6 +284,7 @@ def collect_performance_metrics(target: str, package_name: str, activity_name: s
         "fps": fps,
         "raw": {
             "top": top,
+            "cpuinfo": cpuinfo,
             "meminfo": mem,
             "start": launch,
             "gfxinfo": gfx,
@@ -241,6 +295,9 @@ def collect_performance_metrics(target: str, package_name: str, activity_name: s
 def run_full_benchmark(target: str, package_name: str, activity_name: str, iterations: int = 10) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
 
+    # Keep only benchmark-time logs so GC count is scoped to this run.
+    run_adb_command(["adb", "-s", target, "logcat", "-c"], timeout=10, device_id=target)
+
     # Runtime metrics should be captured immediately after launch to reflect active app behavior.
     _start_app(target, component, timeout=20)
     runtime = collect_performance_metrics(target, package_name, activity_name)
@@ -250,12 +307,14 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
         "warm": run_start_test(target, "warm", component, package_name, iterations),
         "hot": run_start_test(target, "hot", component, package_name, iterations),
     }
+    gc_count = collect_gc_count(target, package_name)
 
     return {
         "runtime_metrics": {
             "cpu": runtime.get("cpu_percent", "N/A"),
             "memory": runtime.get("memory_mb", "N/A"),
             "fps": runtime.get("fps", "N/A"),
+            "gc_count": gc_count,
         },
         "startup_metrics": startup,
         "runtime_details": {
