@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -88,13 +89,16 @@ def _normalize_results(results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {str(device): data for device, data in results.items() if isinstance(data, dict)}
 
 
-def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     runtime_rows: List[Dict[str, Any]] = []
     startup_rows: List[Dict[str, Any]] = []
+    device_rows: List[Dict[str, Any]] = []
 
     for device, device_data in devices.items():
         runtime = device_data.get("runtime_metrics", {}) if isinstance(device_data, dict) else {}
         startup = device_data.get("startup_metrics", {}) if isinstance(device_data, dict) else {}
+        details = device_data.get("device_details", {}) if isinstance(device_data, dict) else {}
+        error = str(device_data.get("error", "")).strip() if isinstance(device_data, dict) else ""
 
         runtime_rows.append(
             {
@@ -103,6 +107,7 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
                 "memory": _metric_value(runtime, "memory", "memory_mb", "avg_memory", "memory_usage"),
                 "fps": _metric_value(runtime, "fps", "avg_fps", "frame_rate"),
                 "gc_count": _metric_value(runtime, "gc_count"),
+                "error": error,
             }
         )
 
@@ -118,7 +123,21 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
             }
         )
 
-    return runtime_rows, startup_rows
+        device_rows.append(
+            {
+                "device": device,
+                "model": str(details.get("model", "N/A")),
+                "manufacturer": str(details.get("manufacturer", "N/A")),
+                "android_version": str(details.get("android_version", "N/A")),
+                "sdk_int": str(details.get("sdk_int", "N/A")),
+                "cpu": str(details.get("cpu", "N/A")),
+                "total_memory_mb": _metric_value(details, "total_memory_mb"),
+                "build_fingerprint": str(details.get("build_fingerprint", "N/A")),
+                "error": error,
+            }
+        )
+
+    return runtime_rows, startup_rows, device_rows
 
 
 def _avg(values: List[float]) -> float | None:
@@ -156,7 +175,7 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
 
 def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "<tr><td colspan=\"5\">No runtime data available</td></tr>"
+        return "<tr><td colspan=\"6\">No runtime data available</td></tr>"
 
     def _perf_class_cpu(cpu: float | None) -> str:
         if not isinstance(cpu, float):
@@ -180,11 +199,12 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     for row in rows:
         rows_html.append(
             "<tr>"
-            f"<td>{row['device']}</td>"
+            f"<td>{escape(row['device'])}</td>"
             f"<td class=\"{_perf_class_cpu(row['cpu'])}\">{_fmt_num(row['cpu'])}</td>"
             f"<td>{_fmt_num(row['memory'])}</td>"
             f"<td class=\"{_perf_class_fps(row['fps'])}\">{_fmt_num(row['fps'])}</td>"
             f"<td>{_fmt_num(row['gc_count'], 0)}</td>"
+            f"<td class=\"{'metric-bad' if row['error'] else 'metric-good'}\">{escape(row['error']) if row['error'] else 'None'}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
@@ -207,13 +227,37 @@ def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
     for row in rows:
         rows_html.append(
             "<tr>"
-            f"<td>{row['device']}</td>"
+            f"<td>{escape(row['device'])}</td>"
             f"<td class=\"{_perf_class_startup(row['cold_avg'])}\">{_fmt_num(row['cold_avg'])}</td>"
             f"<td class=\"{_perf_class_startup(row['warm_avg'])}\">{_fmt_num(row['warm_avg'])}</td>"
             f"<td class=\"{_perf_class_startup(row['hot_avg'])}\">{_fmt_num(row['hot_avg'])}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
+
+
+def _device_rows_html(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "<tr><td colspan=\"9\">No device details available</td></tr>"
+
+    lines: List[str] = []
+    for row in rows:
+        os_label = row["android_version"]
+        if row["sdk_int"] != "N/A":
+            os_label = f"{os_label} (SDK {row['sdk_int']})"
+        lines.append(
+            "<tr>"
+            f"<td>{escape(row['device'])}</td>"
+            f"<td>{escape(row['model'])}</td>"
+            f"<td>{escape(row['manufacturer'])}</td>"
+            f"<td>{escape(os_label)}</td>"
+            f"<td>{escape(row['cpu'])}</td>"
+            f"<td>{_fmt_num(row['total_memory_mb'])}</td>"
+            f"<td class=\"mono\">{escape(row['build_fingerprint'])}</td>"
+            f"<td class=\"{'metric-bad' if row['error'] else 'metric-good'}\">{escape(row['error']) if row['error'] else 'OK'}</td>"
+            "</tr>"
+        )
+    return "\n".join(lines)
 
 
 def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -235,16 +279,26 @@ def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             trimmed.extend([0.0] * (target - len(trimmed)))
         return trimmed
 
+    device_labels = [row["device"] for row in startup_rows]
+    device_avg_values = [
+        round(
+            _avg([value for value in [row["cold_avg"], row["warm_avg"], row["hot_avg"]] if isinstance(value, float)]) or 0.0,
+            2,
+        )
+        for row in startup_rows
+    ]
+
     return {
         "startup_metrics": {
             "cold": {"avg": round(cold_avg, 2), "values": _pad(cold_values)},
             "warm": {"avg": round(warm_avg, 2), "values": _pad(warm_values)},
             "hot": {"avg": round(hot_avg, 2), "values": _pad(hot_values)},
-        }
+        },
+        "device_metrics": {"labels": device_labels, "startup_avg_ms": device_avg_values},
     }
 
 
-def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, chart_data_json: str) -> str:
+def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, device_rows: str, chart_data_json: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -267,10 +321,11 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
 
     .card {{
       background: white;
-      padding: 20px;
-      margin-bottom: 20px;
-      border-radius: 10px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      padding: 22px;
+      margin-bottom: 18px;
+      border-radius: 12px;
+      box-shadow: 0 6px 24px rgba(15,23,42,0.08);
+      border: 1px solid #e5e7eb;
     }}
 
     h1 {{
@@ -289,7 +344,7 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
     }}
 
     th {{
-      background: #4CAF50;
+      background: #0f766e;
       color: white;
       padding: 10px;
       text-align: left;
@@ -298,6 +353,7 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
     td {{
       padding: 10px;
       border-bottom: 1px solid #ddd;
+      vertical-align: top;
     }}
 
     .summary {{
@@ -314,6 +370,17 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       font-weight: bold;
       box-shadow: 0 2px 6px rgba(0,0,0,0.1);
       border-top: 4px solid #4CAF50;
+    }}
+    .mono {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      word-break: break-all;
+      color: #475569;
+    }}
+    .section-subtitle {{
+      color: #64748b;
+      margin: -4px 0 14px;
+      font-size: 14px;
     }}
 
     .summary-card .label {{
@@ -350,6 +417,7 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
     .chart-wrap {{
       display: grid;
       gap: 20px;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     }}
 
     .chart-panel {{
@@ -399,7 +467,26 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
 </div>
 
 <div class=\"card\">
+  <h2>Device Details</h2>
+  <p class=\"section-subtitle\">Hardware/OS details for each tested device (quickly identify environment differences).</p>
+  <table>
+    <tr>
+      <th>Device ID</th>
+      <th>Model</th>
+      <th>Manufacturer</th>
+      <th>OS Version</th>
+      <th>CPU ABI</th>
+      <th>Total Memory (MB)</th>
+      <th>Build Fingerprint</th>
+      <th>Status</th>
+    </tr>
+    {device_rows}
+  </table>
+</div>
+
+<div class=\"card\">
   <h2>Runtime Performance</h2>
+  <p class=\"section-subtitle\">Critical runtime metrics. Error column highlights failed/invalid runs.</p>
   <table>
     <tr>
       <th>Device</th>
@@ -407,6 +494,7 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       <th>Memory (MB)</th>
       <th>FPS</th>
       <th>GC Count</th>
+      <th>Error</th>
     </tr>
     {runtime_rows}
   </table>
@@ -436,6 +524,10 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       <h3>Launch Time Trend (Top 10 Samples)</h3>
       <canvas id=\"lineChart\"></canvas>
     </div>
+    <div class=\"chart-panel\">
+      <h3>Average Startup Time by Device</h3>
+      <canvas id=\"deviceChart\"></canvas>
+    </div>
   </div>
 </div>
 </div>
@@ -447,8 +539,9 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
 
   const ctx = document.getElementById(\"barChart\");
   const ctx2 = document.getElementById(\"lineChart\");
+  const ctx3 = document.getElementById(\"deviceChart\");
 
-  if (!ctx || !ctx2 || typeof Chart === 'undefined') {{
+  if (!ctx || !ctx2 || !ctx3 || typeof Chart === 'undefined') {{
     return;
   }}
 
@@ -495,6 +588,31 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
       }}
     }}
   }});
+
+  const labels = Array.isArray(data.device_metrics?.labels) ? data.device_metrics.labels : [];
+  const values = Array.isArray(data.device_metrics?.startup_avg_ms) ? data.device_metrics.startup_avg_ms : [];
+  if (labels.length > 0 && labels.length === values.length) {{
+    new Chart(ctx3, {{
+      type: 'bar',
+      data: {{
+        labels,
+        datasets: [{{
+          label: 'Avg Startup (ms)',
+          data: values,
+          backgroundColor: '#3b82f6'
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        maintainAspectRatio: false,
+        indexAxis: 'y',
+        layout: {{ padding: 12 }},
+        plugins: {{
+          legend: {{ display: true, position: 'top' }}
+        }}
+      }}
+    }});
+  }}
 }});
 </script>
 
@@ -507,14 +625,15 @@ def generate_report_from_results(results: Dict[str, Any], output_file: Path = OU
     _ensure_local_chart_js()
 
     devices = _normalize_results(results)
-    runtime_data, startup_data = _collect_rows(devices)
+    runtime_data, startup_data, device_data = _collect_rows(devices)
 
     summary = _build_summary(startup_data)
     runtime_rows = _runtime_rows_html(runtime_data)
     startup_rows = _startup_rows_html(startup_data)
+    device_rows = _device_rows_html(device_data)
     chart_data_json = json.dumps(_chart_payload(startup_data))
 
-    html = _html_report(summary, runtime_rows, startup_rows, chart_data_json)
+    html = _html_report(summary, runtime_rows, startup_rows, device_rows, chart_data_json)
     output_file.write_text(html, encoding="utf-8")
     LOGGER.info("Report generated: %s", output_file)
     return output_file
