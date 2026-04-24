@@ -30,25 +30,25 @@ window.Chart=Chart;
 })();"""
 
 
-def _ensure_local_chart_js() -> None:
-    """Ensure Chart.js exists at ./static/chart.min.js (download, then fallback)."""
-    if CHART_JS_FILE.exists() and CHART_JS_FILE.stat().st_size > 0:
+def _ensure_local_chart_js(target_chart_file: Path = CHART_JS_FILE) -> None:
+    """Ensure Chart.js exists at the target path (download, then fallback)."""
+    if target_chart_file.exists() and target_chart_file.stat().st_size > 0:
         return
 
-    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    target_chart_file.parent.mkdir(parents=True, exist_ok=True)
     chart_data = b""
 
     try:
-        LOGGER.info("Downloading Chart.js to %s", CHART_JS_FILE)
+        LOGGER.info("Downloading Chart.js to %s", target_chart_file)
         with urllib.request.urlopen(CHART_JS_URL, timeout=30) as response:
             chart_data = response.read()
     except Exception as exc:  # pragma: no cover - depends on network access
         LOGGER.warning("Chart.js download failed (%s). Using fallback renderer.", exc)
 
     if chart_data:
-        CHART_JS_FILE.write_bytes(chart_data)
+        target_chart_file.write_bytes(chart_data)
     else:
-        CHART_JS_FILE.write_text(MINI_CHART_JS, encoding="utf-8")
+        target_chart_file.write_text(MINI_CHART_JS, encoding="utf-8")
 
 
 def _fmt_num(value: Any, digits: int = 2) -> str:
@@ -772,7 +772,8 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
 
 
 def generate_report_from_results(results: Dict[str, Any], output_file: Path = OUTPUT_FILE) -> Path:
-    _ensure_local_chart_js()
+    chart_js_file = output_file.parent / "static" / "chart.min.js"
+    _ensure_local_chart_js(chart_js_file)
 
     devices = _normalize_results(results)
     runtime_data, startup_data, device_data = _collect_rows(devices)
