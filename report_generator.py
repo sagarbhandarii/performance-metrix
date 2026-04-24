@@ -82,6 +82,19 @@ def _metric_value(source: Dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _startup_bucket(startup: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    aliases = {
+        "cold": ("cold", "cold_start", "coldStart"),
+        "warm": ("warm", "warm_start", "warmStart"),
+        "hot": ("hot", "hot_start", "hotStart"),
+    }
+    for key in aliases.get(mode, (mode,)):
+        value = startup.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 def _normalize_results(results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     if not isinstance(results, dict):
         return {}
@@ -99,6 +112,9 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
     for device, device_data in devices.items():
         runtime = device_data.get("runtime_metrics", {}) if isinstance(device_data, dict) else {}
         startup = device_data.get("startup_metrics", {}) if isinstance(device_data, dict) else {}
+        cold = _startup_bucket(startup, "cold")
+        warm = _startup_bucket(startup, "warm")
+        hot = _startup_bucket(startup, "hot")
         details = device_data.get("device_details", {}) if isinstance(device_data, dict) else {}
         error = str(device_data.get("error", "")).strip() if isinstance(device_data, dict) else ""
 
@@ -119,12 +135,12 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
         startup_rows.append(
             {
                 "device": device,
-                "cold_avg": _metric_value(startup.get("cold", {}), "avg"),
-                "warm_avg": _metric_value(startup.get("warm", {}), "avg"),
-                "hot_avg": _metric_value(startup.get("hot", {}), "avg"),
-                "cold_values": _as_list(startup.get("cold", {}).get("values")),
-                "warm_values": _as_list(startup.get("warm", {}).get("values")),
-                "hot_values": _as_list(startup.get("hot", {}).get("values")),
+                "cold_avg": _metric_value(cold, "avg", "average"),
+                "warm_avg": _metric_value(warm, "avg", "average"),
+                "hot_avg": _metric_value(hot, "avg", "average"),
+                "cold_values": _as_list(cold.get("values") or cold.get("samples")),
+                "warm_values": _as_list(warm.get("values") or warm.get("samples")),
+                "hot_values": _as_list(hot.get("values") or hot.get("samples")),
             }
         )
 
@@ -348,7 +364,11 @@ def _device_rows_html(rows: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _chart_payload(startup_rows: List[Dict[str, Any]], runtime_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _chart_payload(
+    startup_rows: List[Dict[str, Any]],
+    runtime_rows: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    runtime_rows = runtime_rows or []
     cold_avg = _avg([row["cold_avg"] for row in startup_rows if isinstance(row["cold_avg"], float)])
     warm_avg = _avg([row["warm_avg"] for row in startup_rows if isinstance(row["warm_avg"], float)])
     hot_avg = _avg([row["hot_avg"] for row in startup_rows if isinstance(row["hot_avg"], float)])
