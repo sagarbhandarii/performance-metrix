@@ -432,6 +432,42 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       font-size: 16px;
     }}
 
+    .chart-container {{
+      position: relative;
+      min-height: 340px;
+    }}
+
+    .chart-message {{
+      display: none;
+      align-items: center;
+      justify-content: center;
+      min-height: 340px;
+      text-align: center;
+      color: #6b7280;
+      font-size: 14px;
+      border: 1px dashed #d1d5db;
+      border-radius: 8px;
+      padding: 12px;
+      background: #ffffff;
+    }}
+
+    .chart-panel.no-data canvas,
+    .chart-panel.error canvas {{
+      display: none;
+    }}
+
+    .chart-panel.no-data .chart-message,
+    .chart-panel.error .chart-message {{
+      display: flex;
+    }}
+
+    .chart-panel.error .chart-message {{
+      color: #b91c1c;
+      border-color: #fecaca;
+      background: #fff1f2;
+      font-weight: 600;
+    }}
+
     canvas {{
       width: 100%;
       height: 340px;
@@ -516,17 +552,26 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
 <div class=\"card\">
   <h2>Performance Charts</h2>
   <div class=\"chart-wrap\">
-    <div class=\"chart-panel\">
+    <div class=\"chart-panel\" id=\"barPanel\">
       <h3>Average Launch Time by Mode</h3>
-      <canvas id=\"barChart\"></canvas>
+      <div class=\"chart-container\">
+        <canvas id=\"barChart\"></canvas>
+        <div class=\"chart-message\" id=\"barChartMessage\">No data available.</div>
+      </div>
     </div>
-    <div class=\"chart-panel\">
+    <div class=\"chart-panel\" id=\"linePanel\">
       <h3>Launch Time Trend (Top 10 Samples)</h3>
-      <canvas id=\"lineChart\"></canvas>
+      <div class=\"chart-container\">
+        <canvas id=\"lineChart\"></canvas>
+        <div class=\"chart-message\" id=\"lineChartMessage\">No data available.</div>
+      </div>
     </div>
-    <div class=\"chart-panel\">
+    <div class=\"chart-panel\" id=\"devicePanel\">
       <h3>Average Startup Time by Device</h3>
-      <canvas id=\"deviceChart\"></canvas>
+      <div class=\"chart-container\">
+        <canvas id=\"deviceChart\"></canvas>
+        <div class=\"chart-message\" id=\"deviceChartMessage\">No data available.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -536,82 +581,151 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
 <script>
 document.addEventListener(\"DOMContentLoaded\", function () {{
   const data = {chart_data_json};
+  const reportPrefix = '[Performance Report]';
 
   const ctx = document.getElementById(\"barChart\");
   const ctx2 = document.getElementById(\"lineChart\");
   const ctx3 = document.getElementById(\"deviceChart\");
+  const barPanel = document.getElementById(\"barPanel\");
+  const linePanel = document.getElementById(\"linePanel\");
+  const devicePanel = document.getElementById(\"devicePanel\");
 
-  if (!ctx || !ctx2 || !ctx3 || typeof Chart === 'undefined') {{
+  function setPanelMessage(panel, message, isError) {{
+    if (!panel) return;
+    panel.classList.remove('no-data', 'error');
+    panel.classList.add(isError ? 'error' : 'no-data');
+    const messageElement = panel.querySelector('.chart-message');
+    if (messageElement) {{
+      messageElement.textContent = message;
+    }}
+  }}
+
+  function toNumberArray(values) {{
+    if (!Array.isArray(values)) return [];
+    return values.filter((value) => typeof value === 'number' && Number.isFinite(value));
+  }}
+
+  function hasPositiveValue(values) {{
+    return values.some((value) => value > 0);
+  }}
+
+  if (!ctx || !ctx2 || !ctx3) {{
+    console.error(`${{reportPrefix}} Missing canvas elements for chart rendering.`);
+    setPanelMessage(barPanel, 'Chart container is unavailable.', true);
+    setPanelMessage(linePanel, 'Chart container is unavailable.', true);
+    setPanelMessage(devicePanel, 'Chart container is unavailable.', true);
     return;
   }}
 
-  new Chart(ctx, {{
-    type: 'bar',
-    data: {{
-      labels: ['Cold','Warm','Hot'],
-      datasets: [{{
-        label: 'Avg Launch Time',
-        data: [
-          data.startup_metrics.cold.avg,
-          data.startup_metrics.warm.avg,
-          data.startup_metrics.hot.avg
-        ],
-        backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
-      }}]
-    }},
-    options: {{
-      responsive: true,
-      maintainAspectRatio: false,
-      layout: {{ padding: 12 }},
-      plugins: {{
-        legend: {{ display: true, position: 'top' }}
-      }}
-    }}
-  }});
+  if (typeof Chart === 'undefined') {{
+    console.error(`${{reportPrefix}} Chart.js failed to load from static/chart.min.js.`);
+    setPanelMessage(barPanel, 'Unable to load chart library.', true);
+    setPanelMessage(linePanel, 'Unable to load chart library.', true);
+    setPanelMessage(devicePanel, 'Unable to load chart library.', true);
+    return;
+  }}
 
-  new Chart(ctx2, {{
-    type: 'line',
-    data: {{
-      labels: [1,2,3,4,5,6,7,8,9,10],
-      datasets: [
-        {{ label: 'Cold', data: data.startup_metrics.cold.values, borderColor: '#ef4444', fill: false }},
-        {{ label: 'Warm', data: data.startup_metrics.warm.values, borderColor: '#f59e0b', fill: false }},
-        {{ label: 'Hot', data: data.startup_metrics.hot.values, borderColor: '#22c55e', fill: false }}
-      ]
-    }},
-    options: {{
-      responsive: true,
-      maintainAspectRatio: false,
-      layout: {{ padding: 12 }},
-      plugins: {{
-        legend: {{ display: true, position: 'top' }}
-      }}
-    }}
-  }});
+  const startupMetrics = data && typeof data === 'object' ? data.startup_metrics || {{}} : {{}};
+  const coldAvg = Number(startupMetrics?.cold?.avg);
+  const warmAvg = Number(startupMetrics?.warm?.avg);
+  const hotAvg = Number(startupMetrics?.hot?.avg);
+  const barValues = [coldAvg, warmAvg, hotAvg].map((value) => (Number.isFinite(value) ? value : 0));
+  const coldTrend = toNumberArray(startupMetrics?.cold?.values);
+  const warmTrend = toNumberArray(startupMetrics?.warm?.values);
+  const hotTrend = toNumberArray(startupMetrics?.hot?.values);
 
   const labels = Array.isArray(data.device_metrics?.labels) ? data.device_metrics.labels : [];
-  const values = Array.isArray(data.device_metrics?.startup_avg_ms) ? data.device_metrics.startup_avg_ms : [];
-  if (labels.length > 0 && labels.length === values.length) {{
-    new Chart(ctx3, {{
-      type: 'bar',
-      data: {{
-        labels,
-        datasets: [{{
-          label: 'Avg Startup (ms)',
-          data: values,
-          backgroundColor: '#3b82f6'
-        }}]
-      }},
-      options: {{
-        responsive: true,
-        maintainAspectRatio: false,
-        indexAxis: 'y',
-        layout: {{ padding: 12 }},
-        plugins: {{
-          legend: {{ display: true, position: 'top' }}
+  const values = toNumberArray(data.device_metrics?.startup_avg_ms);
+
+  try {{
+    if (hasPositiveValue(barValues)) {{
+      new Chart(ctx, {{
+        type: 'bar',
+        data: {{
+          labels: ['Cold','Warm','Hot'],
+          datasets: [{{
+            label: 'Avg Launch Time',
+            data: barValues,
+            backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
+          }}]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          layout: {{ padding: 12 }},
+          plugins: {{
+            legend: {{ display: true, position: 'top' }}
+          }}
         }}
-      }}
-    }});
+      }});
+    }} else {{
+      console.warn(`${{reportPrefix}} No startup average data for bar chart.`);
+      setPanelMessage(barPanel, 'No data available.', false);
+    }}
+  }} catch (error) {{
+    console.error(`${{reportPrefix}} Failed to render average launch chart.`, error);
+    setPanelMessage(barPanel, 'Unable to render chart.', true);
+  }}
+
+  try {{
+    if (hasPositiveValue(coldTrend) || hasPositiveValue(warmTrend) || hasPositiveValue(hotTrend)) {{
+      new Chart(ctx2, {{
+        type: 'line',
+        data: {{
+          labels: [1,2,3,4,5,6,7,8,9,10],
+          datasets: [
+            {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', fill: false }},
+            {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', fill: false }},
+            {{ label: 'Hot', data: hotTrend, borderColor: '#22c55e', fill: false }}
+          ]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          layout: {{ padding: 12 }},
+          plugins: {{
+            legend: {{ display: true, position: 'top' }}
+          }}
+        }}
+      }});
+    }} else {{
+      console.warn(`${{reportPrefix}} No startup trend samples for line chart.`);
+      setPanelMessage(linePanel, 'No data available.', false);
+    }}
+  }} catch (error) {{
+    console.error(`${{reportPrefix}} Failed to render launch trend chart.`, error);
+    setPanelMessage(linePanel, 'Unable to render chart.', true);
+  }}
+
+  try {{
+    if (labels.length > 0 && labels.length === values.length && hasPositiveValue(values)) {{
+      new Chart(ctx3, {{
+        type: 'bar',
+        data: {{
+          labels,
+          datasets: [{{
+            label: 'Avg Startup (ms)',
+            data: values,
+            backgroundColor: '#3b82f6'
+          }}]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          indexAxis: 'y',
+          layout: {{ padding: 12 }},
+          plugins: {{
+            legend: {{ display: true, position: 'top' }}
+          }}
+        }}
+      }});
+    }} else {{
+      console.warn(`${{reportPrefix}} No device-level startup data for device chart.`);
+      setPanelMessage(devicePanel, 'No data available.', false);
+    }}
+  }} catch (error) {{
+    console.error(`${{reportPrefix}} Failed to render device startup chart.`, error);
+    setPanelMessage(devicePanel, 'Unable to render chart.', true);
   }}
 }});
 </script>
