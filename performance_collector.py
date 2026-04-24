@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import time
+from threading import Lock
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -27,6 +28,7 @@ RUNTIME_OBSERVATION_WINDOW_SECONDS = 60
 CPU_SAMPLE_INTERVAL_SECONDS = 5
 ADB_RETRY_COUNT = 1
 LAST_VALID_RUNTIME_BY_DEVICE: Dict[str, Dict[str, float]] = {}
+LAST_VALID_RUNTIME_LOCK = Lock()
 
 
 def set_debug(enabled: bool) -> None:
@@ -56,6 +58,12 @@ def set_runtime_collection(window_seconds: int, sample_interval_seconds: int) ->
 def set_adb_retries(retries: int) -> None:
     global ADB_RETRY_COUNT
     ADB_RETRY_COUNT = max(0, retries)
+
+
+def reset_runtime_cache() -> None:
+    """Clear in-memory runtime cache to avoid stale cross-run fallback."""
+    with LAST_VALID_RUNTIME_LOCK:
+        LAST_VALID_RUNTIME_BY_DEVICE.clear()
 
 
 def _debug_log(message: str) -> None:
@@ -345,11 +353,7 @@ def _collect_runtime_metrics_with_retries(
     attempts: int = 3,
 ) -> Dict[str, Any]:
     runtime_last: Dict[str, Any] = {}
-    cached_metrics: Dict[str, MetricValue] = {
-        "cpu": LAST_VALID_RUNTIME_BY_DEVICE.get(target, {}).get("cpu", "N/A"),
-        "memory": LAST_VALID_RUNTIME_BY_DEVICE.get(target, {}).get("memory", "N/A"),
-        "fps": LAST_VALID_RUNTIME_BY_DEVICE.get(target, {}).get("fps", "N/A"),
-    }
+    cached_metrics: Dict[str, MetricValue] = {"cpu": "N/A", "memory": "N/A", "fps": "N/A"}
 
     for attempt in range(1, max(1, attempts) + 1):
         runtime_last = collect_performance_metrics(target, package_name, activity_name, launch_before_collect=False)
@@ -365,11 +369,12 @@ def _collect_runtime_metrics_with_retries(
     runtime_last["cpu"] = _runtime_metric_or_cached(runtime_last.get("cpu", "N/A"), cached_metrics["cpu"], "cpu", target)
     runtime_last["memory"] = _runtime_metric_or_cached(runtime_last.get("memory", "N/A"), cached_metrics["memory"], "memory", target)
     runtime_last["fps"] = _runtime_metric_or_cached(runtime_last.get("fps", "N/A"), cached_metrics["fps"], "fps", target)
-    LAST_VALID_RUNTIME_BY_DEVICE.setdefault(target, {})
-    for metric in ("cpu", "memory", "fps"):
-        value = runtime_last.get(metric, "N/A")
-        if isinstance(value, float):
-            LAST_VALID_RUNTIME_BY_DEVICE[target][metric] = value
+    with LAST_VALID_RUNTIME_LOCK:
+        LAST_VALID_RUNTIME_BY_DEVICE.setdefault(target, {})
+        for metric in ("cpu", "memory", "fps"):
+            value = runtime_last.get(metric, "N/A")
+            if isinstance(value, float):
+                LAST_VALID_RUNTIME_BY_DEVICE[target][metric] = value
     return runtime_last
 
 
@@ -413,7 +418,7 @@ def collect_gc_count(target: str, package_name: str, max_lines: int = 4000) -> i
             total += 1
             continue
         if not pids:
-            total += 1
+            _debug_log(f"[{target}] GC line ignored without pid/package match: {line}")
 
     _debug_log(f"[{target}] GC count for {package_name}: {total}")
     return total
@@ -426,8 +431,15 @@ def collect_cpu_average(
     interval_seconds: int = CPU_SAMPLE_INTERVAL_SECONDS,
 ) -> MetricValue:
     samples: List[float] = []
-    deadline = time.time() + max(1, duration_seconds)
-    while time.time() < deadline:
+    duration_seconds = max(1, duration_seconds)
+    interval_seconds = max(1, interval_seconds)
+    sample_count = max(1, duration_seconds // interval_seconds)
+    _debug_log(
+        f"[{target}] CPU averaging configuration => duration={duration_seconds}s interval={interval_seconds}s samples={sample_count}"
+    )
+
+    start_time = time.monotonic()
+    for idx in range(sample_count):
         top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
         cpu = parse_cpu_usage(top["output"], package_name) if top["success"] else "N/A"
         if cpu == "N/A":
@@ -441,7 +453,10 @@ def collect_cpu_average(
         if isinstance(cpu, float):
             samples.append(cpu)
             _debug_log(f"[{target}] CPU sample: {cpu}%")
-        time.sleep(max(1, interval_seconds))
+        next_tick = start_time + ((idx + 1) * interval_seconds)
+        sleep_seconds = next_tick - time.monotonic()
+        if sleep_seconds > 0 and idx + 1 < sample_count:
+            time.sleep(sleep_seconds)
 
     if not samples:
         return "N/A"
@@ -452,6 +467,17 @@ def collect_cpu_average(
 
 def _start_app(target: str, component: str, timeout: int = 20) -> Dict[str, Any]:
     return run_adb_command(["adb", "-s", target, "shell", "am", "start", "-W", "-n", component], timeout=timeout, device_id=target)
+
+
+def _start_app_with_retry(target: str, component: str, timeout: int = 20, attempts: int = 2) -> Dict[str, Any]:
+    last: Dict[str, Any] = {"success": False, "output": "", "error": "uninitialized"}
+    for attempt in range(1, max(1, attempts) + 1):
+        last = _start_app(target, component, timeout=timeout)
+        if last.get("success"):
+            return last
+        _debug_log(f"[{target}] start attempt {attempt}/{attempts} failed: {last.get('error')}")
+        time.sleep(0.5)
+    return last
 
 
 def run_start_test(device: str, start_type: str, component: str, package: str, iterations: int = 10) -> Dict[str, Any]:
@@ -469,7 +495,7 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
         else:
             raise ValueError(f"Unknown start type: {start_type}")
 
-        launch = _start_app(device, component, timeout=20)
+        launch = _start_app_with_retry(device, component, timeout=20, attempts=2)
         if launch["success"]:
             parsed = parse_launch_times(launch["output"])
             total = parsed.get("TotalTime")
@@ -567,6 +593,10 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
         _debug_log(f"[{target}] Device not in ready state before benchmark: {state}")
 
     run_adb_command(["adb", "-s", target, "logcat", "-c"], timeout=10, device_id=target)
+    LOGGER.info(
+        "[%s] Assumptions: app remains in foreground during runtime sampling; CPU/FPS are sampled from adb shell outputs.",
+        target,
+    )
 
     _start_app(target, component, timeout=20)
     avg_cpu = collect_cpu_average(
@@ -587,7 +617,7 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     }
 
     LOGGER.info("[%s] Benchmark step 4/4: Build benchmark result payload", target)
-    return {
+    result = {
         "device_details": device_details,
         "runtime_metrics": {
             "cpu": runtime_cpu,
@@ -603,6 +633,55 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
             "raw": runtime.get("raw", {}),
         },
     }
+    return validate_benchmark_result(result, target)
+
+
+def _avg_of_values(values: List[float]) -> float:
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
+def validate_benchmark_result(result: Dict[str, Any], target: str) -> Dict[str, Any]:
+    """Validate and normalize metric ranges for deterministic payload quality."""
+    runtime = result.get("runtime_metrics", {}) if isinstance(result.get("runtime_metrics"), dict) else {}
+    startup = result.get("startup_metrics", {}) if isinstance(result.get("startup_metrics"), dict) else {}
+
+    def _normalize_metric(value: MetricValue, low: float, high: float, name: str) -> MetricValue:
+        if not isinstance(value, float):
+            return "N/A"
+        if low <= value <= high:
+            return value
+        LOGGER.warning("[%s] %s out of range (%s). Marking as N/A.", target, name, value)
+        return "N/A"
+
+    runtime["cpu"] = _normalize_metric(runtime.get("cpu", "N/A"), 0.0, 400.0, "cpu")
+    runtime["memory"] = _normalize_metric(runtime.get("memory", "N/A"), 0.0, 1024.0 * 64, "memory")
+    runtime["fps"] = _normalize_metric(runtime.get("fps", "N/A"), 0.0, 240.0, "fps")
+    if not isinstance(runtime.get("gc_count"), int) or runtime.get("gc_count", 0) < 0:
+        LOGGER.warning("[%s] gc_count invalid (%s). Resetting to 0.", target, runtime.get("gc_count"))
+        runtime["gc_count"] = 0
+
+    for mode in ("cold", "warm", "hot"):
+        bucket = startup.get(mode)
+        if not isinstance(bucket, dict):
+            startup[mode] = {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"}
+            continue
+        values = [float(v) for v in bucket.get("values", []) if isinstance(v, (int, float)) and v >= 0]
+        if len(values) != len(bucket.get("values", [])):
+            LOGGER.warning("[%s] startup %s had invalid values; filtered.", target, mode)
+        bucket["values"] = values
+        if values:
+            bucket["avg"] = round(_avg_of_values(values), 2)
+            bucket["min"] = round(min(values), 2)
+            bucket["max"] = round(max(values), 2)
+        else:
+            bucket["avg"] = "N/A"
+            bucket["min"] = "N/A"
+            bucket["max"] = "N/A"
+        startup[mode] = bucket
+
+    result["runtime_metrics"] = runtime
+    result["startup_metrics"] = startup
+    return result
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,5 +1,7 @@
 import unittest
+from unittest import mock
 
+import orchestrator
 import performance_collector
 import report_generator
 
@@ -47,6 +49,41 @@ class PerformanceCollectorParsingTests(unittest.TestCase):
         self.assertEqual(result["TotalTime"], 22)
         self.assertEqual(result["WaitTime"], "N/A")
 
+    def test_collect_cpu_average_uses_fixed_sample_count(self) -> None:
+        with mock.patch.object(performance_collector, "run_adb_command") as mock_run, mock.patch.object(
+            performance_collector, "time"
+        ) as mock_time:
+            mock_run.return_value = {"success": True, "output": "1234 20% S com.example.app", "error": ""}
+            mock_time.monotonic.side_effect = [0, 0.1, 5.2, 10.4, 15.0]
+            mock_time.sleep.return_value = None
+
+            avg = performance_collector.collect_cpu_average(
+                "device-1",
+                "com.example.app",
+                duration_seconds=15,
+                interval_seconds=5,
+            )
+
+        self.assertEqual(avg, 20.0)
+        self.assertEqual(mock_run.call_count, 3)
+
+    def test_validate_benchmark_result_normalizes_invalid_runtime_metrics(self) -> None:
+        raw = {
+            "runtime_metrics": {"cpu": 500.0, "memory": -3.0, "fps": 300.0, "gc_count": -1},
+            "startup_metrics": {
+                "cold": {"values": [100.0, -50.0]},
+                "warm": {"values": []},
+                "hot": {"values": [20.0]},
+            },
+        }
+        validated = performance_collector.validate_benchmark_result(raw, "device-1")
+        self.assertEqual(validated["runtime_metrics"]["cpu"], "N/A")
+        self.assertEqual(validated["runtime_metrics"]["memory"], "N/A")
+        self.assertEqual(validated["runtime_metrics"]["fps"], "N/A")
+        self.assertEqual(validated["runtime_metrics"]["gc_count"], 0)
+        self.assertEqual(validated["startup_metrics"]["cold"]["values"], [100.0])
+        self.assertEqual(validated["startup_metrics"]["cold"]["avg"], 100.0)
+
 
 class ReportGeneratorPayloadTests(unittest.TestCase):
     def test_chart_payload_uses_nullable_padding(self) -> None:
@@ -82,6 +119,22 @@ class ReportGeneratorPayloadTests(unittest.TestCase):
         self.assertEqual(startup_rows[0]["warm_avg"], 850.0)
         self.assertEqual(startup_rows[0]["hot_avg"], 700.0)
         self.assertEqual(startup_rows[0]["warm_values"], [800.0, 900.0])
+
+
+class OrchestratorStabilityTests(unittest.TestCase):
+    def test_stage_collect_and_save_is_sorted_and_stable(self) -> None:
+        with mock.patch("pathlib.Path.write_text") as write_text:
+            orchestrator.stage_collect_and_save(
+                {
+                    "device-b": {"runtime_metrics": {"cpu": 1.0}},
+                    "device-a": {"runtime_metrics": {"cpu": 2.0}},
+                }
+            )
+        self.assertEqual(write_text.call_count, 2)
+        serialized = write_text.call_args_list[0].args[0]
+        self.assertIn('"device-a"', serialized)
+        self.assertLess(serialized.find('"device-a"'), serialized.find('"device-b"'))
+        self.assertEqual(serialized, write_text.call_args_list[1].args[0])
 
 
 if __name__ == "__main__":
