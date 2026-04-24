@@ -49,6 +49,12 @@ class PerformanceCollectorParsingTests(unittest.TestCase):
         self.assertEqual(result["TotalTime"], 22)
         self.assertEqual(result["WaitTime"], "N/A")
 
+    def test_parse_launch_times_with_thousands_separator(self) -> None:
+        result = performance_collector.parse_launch_times("ThisTime: 1,234\nTotalTime: 2,345\nWaitTime: 3,456")
+        self.assertEqual(result["ThisTime"], 1234)
+        self.assertEqual(result["TotalTime"], 2345)
+        self.assertEqual(result["WaitTime"], 3456)
+
     def test_collect_cpu_average_uses_fixed_sample_count(self) -> None:
         with mock.patch.object(performance_collector, "run_adb_command") as mock_run, mock.patch.object(
             performance_collector, "time"
