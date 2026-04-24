@@ -194,7 +194,7 @@ python orchestrator.py --apk /absolute/path/to/app.apk --package com.example.app
 Optional arguments:
 
 ```bash
---max-threads 4 --timeout 90 --verbose
+--max-threads 4 --timeout 90 --output-dir performance_runs --debug
 ```
 
 ## Execution flow (what happens internally)
@@ -202,8 +202,8 @@ Optional arguments:
 1. **Register new devices**: discovers USB devices and adds unregistered devices into `devices.json`.
 2. **Reconnect known devices**: retries `adb connect` and marks each device `available` or `offline`.
 3. **Filter available devices**: only devices with status `available` continue.
-4. **Install and launch in parallel**: installs APK and starts `<package>/<activity>`.
-5. **Collect metrics** per successful device: CPU, memory, launch time, FPS.
+4. **Install and launch in parallel**: installs APK and starts `<package>/<activity>` on all available devices.
+5. **Collect metrics in parallel** per successful device: CPU, memory, launch time, FPS.
 6. **Generate HTML report** from collected JSON data.
 
 At end, a summary is printed: device count, success count, failure count, report path.
@@ -212,26 +212,29 @@ At end, a summary is printed: device count, success count, failure count, report
 
 ## 6) Output files
 
-All paths below are generated in the **project root**:
+Each run now creates a single folder under `performance_runs/`:
 
-- Device registry: `devices.json`
-- Metrics output: `performance_results.json`
-- HTML report: `report.html`
-- Logs: `logs/test_run_<timestamp>.log`
+- Run folder: `performance_runs/run_<timestamp>/`
+- Metrics output: `performance_runs/run_<timestamp>/performance_results.json`
+- Final JSON: `performance_runs/run_<timestamp>/final_results.json`
+- HTML report: `performance_runs/run_<timestamp>/report.html`
+- Logs: `performance_runs/run_<timestamp>/logs/`
+
+Device registry is still maintained in project root as `devices.json`.
 
 Open HTML report:
 
 - **Windows**
   ```powershell
-  start .\report.html
+  start .\performance_runs\run_<timestamp>\report.html
   ```
 - **macOS**
   ```bash
-  open report.html
+  open performance_runs/run_<timestamp>/report.html
   ```
 - **Linux**
   ```bash
-  xdg-open report.html
+  xdg-open performance_runs/run_<timestamp>/report.html
   ```
 
 ---

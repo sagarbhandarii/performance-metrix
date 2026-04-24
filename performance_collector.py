@@ -18,6 +18,7 @@ import logging_config
 OUTPUT_FILE = Path("performance_results.json")
 FINAL_RESULTS_FILE = Path("final_results.json")
 DEBUG_LOG_FILE = Path("logs/debug.txt")
+LOGS_DIR = Path("logs")
 LOGGER = logging_config.get_logger("performance_collector")
 DEBUG_MODE = False
 
@@ -34,6 +35,15 @@ def set_debug(enabled: bool) -> None:
         DEBUG_LOG_FILE.write_text("", encoding="utf-8")
 
 
+def set_output_directory(output_dir: Path) -> None:
+    """Configure output + log paths for a single orchestrated run."""
+    global OUTPUT_FILE, FINAL_RESULTS_FILE, DEBUG_LOG_FILE, LOGS_DIR
+    OUTPUT_FILE = output_dir / "performance_results.json"
+    FINAL_RESULTS_FILE = output_dir / "final_results.json"
+    LOGS_DIR = output_dir / "logs"
+    DEBUG_LOG_FILE = LOGS_DIR / "debug.txt"
+
+
 def _debug_log(message: str) -> None:
     if not DEBUG_MODE:
         return
@@ -44,7 +54,7 @@ def _debug_log(message: str) -> None:
 
 def _device_log_path(device_id: str) -> Path:
     safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", device_id)
-    path = Path("logs") / f"{safe_id}.log"
+    path = LOGS_DIR / f"{safe_id}.log"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
