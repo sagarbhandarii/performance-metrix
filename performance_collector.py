@@ -9,7 +9,7 @@ import re
 import time
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, Iterable, List, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import adb_client
 import device_registry
@@ -26,6 +26,7 @@ MetricValue = Union[float, str]
 RUNTIME_OBSERVATION_WINDOW_SECONDS = 60
 CPU_SAMPLE_INTERVAL_SECONDS = 5
 ADB_RETRY_COUNT = 1
+LAST_VALID_RUNTIME_BY_DEVICE: Dict[str, Dict[str, float]] = {}
 
 
 def set_debug(enabled: bool) -> None:
@@ -186,58 +187,87 @@ def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
     for line in top_output.splitlines():
         if package_name not in line:
             continue
+        _debug_log(f"CPU parse candidate(top): {line}")
         percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
         if percent_match:
             value = float(percent_match.group(1))
             _debug_log(f"Parsed CPU from line (% style): {line} => {value}")
             return value
 
-        # Newer Android top outputs may expose %CPU as a numeric column (without %).
-        cpu_column_match = re.search(
-            r"\b[SRDTZX]\s+([0-9]+(?:\.[0-9]+)?)\s+[0-9]+(?:\.[0-9]+)?\s+\S+\s+.+$",
-            line,
-        )
-        if cpu_column_match:
-            value = float(cpu_column_match.group(1))
-            _debug_log(f"Parsed CPU from line (column style): {line} => {value}")
-            return value
+        # Newer Android top outputs may expose %CPU as a plain numeric token near status column.
+        tokens = line.split()
+        for idx, token in enumerate(tokens):
+            if token in {"S", "R", "D", "T", "Z", "X", "I"} and idx + 1 < len(tokens):
+                candidate = tokens[idx + 1]
+                if re.fullmatch(r"\d+(?:\.\d+)?", candidate):
+                    value = float(candidate)
+                    _debug_log(f"Parsed CPU from line (token style): {line} => {value}")
+                    return value
+        for token in tokens:
+            if re.fullmatch(r"\d+(?:\.\d+)?", token):
+                value = float(token)
+                if 0.0 <= value <= 400.0:
+                    _debug_log(f"Parsed CPU from line (generic token): {line} => {value}")
+                    return value
     return "N/A"
 
 
 def parse_cpu_usage_cpuinfo(cpuinfo_output: str, package_name: str) -> MetricValue:
     escaped_pkg = re.escape(package_name)
+    candidates: List[float] = []
     for line in cpuinfo_output.splitlines():
         if package_name not in line:
             continue
+        _debug_log(f"CPU parse candidate(cpuinfo): {line}")
         match = re.search(rf"^\s*([0-9]+(?:\.[0-9]+)?)%\s+\d+/{escaped_pkg}(?::\S+)?\b", line)
         if not match:
             match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", line)
         if match:
-            value = float(match.group(1))
-            _debug_log(f"Parsed CPU from cpuinfo line: {line} => {value}")
-            return value
+            candidates.append(float(match.group(1)))
+    if candidates:
+        # dumpsys cpuinfo can include multiple process lines; max is the app process load.
+        value = round(max(candidates), 2)
+        _debug_log(f"Parsed CPU from cpuinfo candidates: {candidates} => {value}")
+        return value
     return "N/A"
 
 
-def parse_memory_mb(meminfo_output: str) -> MetricValue:
+def _to_mb(value: float, unit: str) -> float:
+    normalized_unit = unit.upper()
+    if normalized_unit == "KB":
+        return value / 1024
+    if normalized_unit == "GB":
+        return value * 1024
+    return value
+
+
+def parse_memory_metrics(meminfo_output: str) -> Dict[str, MetricValue]:
     normalized = meminfo_output.replace(",", "")
-    patterns = [
-        r"TOTAL\s+PSS:\s*([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?",
-        r"\bTOTAL\b\s+([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?",
+    result: Dict[str, MetricValue] = {"total_pss_mb": "N/A", "total_rss_mb": "N/A", "total_mb": "N/A"}
+    metric_patterns: List[Tuple[str, str]] = [
+        ("total_pss_mb", r"TOTAL\s+PSS:\s*([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?"),
+        ("total_rss_mb", r"TOTAL\s+RSS:\s*([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?"),
+        ("total_mb", r"\bTOTAL\b\s+([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?"),
     ]
-    for pattern in patterns:
+
+    for key, pattern in metric_patterns:
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
         if not match:
             continue
-        value = float(match.group(1))
-        unit = (match.group(2) or "KB").upper()
-        if unit == "KB":
-            value = value / 1024
-        elif unit == "GB":
-            value = value * 1024
-        parsed = round(value, 2)
-        _debug_log(f"Parsed memory from line: {match.group(0)} => {parsed} MB")
-        return parsed
+        parsed = round(_to_mb(float(match.group(1)), (match.group(2) or "KB")), 2)
+        _debug_log(f"Parsed memory metric {key} from line: {match.group(0)} => {parsed} MB")
+        result[key] = parsed
+    if isinstance(result["total_pss_mb"], float):
+        result["total_mb"] = result["total_pss_mb"]
+    elif isinstance(result["total_rss_mb"], float):
+        result["total_mb"] = result["total_rss_mb"]
+    return result
+
+
+def parse_memory_mb(meminfo_output: str) -> MetricValue:
+    metrics = parse_memory_metrics(meminfo_output)
+    if isinstance(metrics.get("total_mb"), float):
+        return metrics["total_mb"]
     return "N/A"
 
 
@@ -273,6 +303,32 @@ def parse_fps(gfxinfo_output: str) -> MetricValue:
     return "N/A"
 
 
+def parse_surfaceflinger_fps(latency_output: str) -> MetricValue:
+    rows = [line.strip() for line in latency_output.splitlines() if line.strip()]
+    deltas_ns: List[int] = []
+    previous_present: Optional[int] = None
+    for row in rows:
+        if not re.fullmatch(r"[-0-9 ]+", row):
+            continue
+        parts = row.split()
+        if len(parts) < 3:
+            continue
+        present_ns = int(parts[1])
+        if present_ns <= 0 or present_ns >= 9223372036854775807:
+            continue
+        if previous_present is not None and present_ns > previous_present:
+            deltas_ns.append(present_ns - previous_present)
+        previous_present = present_ns
+    if not deltas_ns:
+        return "N/A"
+    average_delta_ns = mean(deltas_ns)
+    if average_delta_ns <= 0:
+        return "N/A"
+    fps = round(min(240.0, 1_000_000_000.0 / average_delta_ns), 2)
+    _debug_log(f"Parsed FPS from SurfaceFlinger latency: {fps} (samples={len(deltas_ns)})")
+    return fps
+
+
 def _runtime_metric_or_cached(value: MetricValue, cached: MetricValue, metric_name: str, target: str) -> MetricValue:
     if isinstance(value, float):
         return value
@@ -289,7 +345,11 @@ def _collect_runtime_metrics_with_retries(
     attempts: int = 3,
 ) -> Dict[str, Any]:
     runtime_last: Dict[str, Any] = {}
-    cached_metrics: Dict[str, MetricValue] = {"cpu": "N/A", "memory": "N/A", "fps": "N/A"}
+    cached_metrics: Dict[str, MetricValue] = {
+        "cpu": LAST_VALID_RUNTIME_BY_DEVICE.get(target, {}).get("cpu", "N/A"),
+        "memory": LAST_VALID_RUNTIME_BY_DEVICE.get(target, {}).get("memory", "N/A"),
+        "fps": LAST_VALID_RUNTIME_BY_DEVICE.get(target, {}).get("fps", "N/A"),
+    }
 
     for attempt in range(1, max(1, attempts) + 1):
         runtime_last = collect_performance_metrics(target, package_name, activity_name, launch_before_collect=False)
@@ -305,6 +365,11 @@ def _collect_runtime_metrics_with_retries(
     runtime_last["cpu"] = _runtime_metric_or_cached(runtime_last.get("cpu", "N/A"), cached_metrics["cpu"], "cpu", target)
     runtime_last["memory"] = _runtime_metric_or_cached(runtime_last.get("memory", "N/A"), cached_metrics["memory"], "memory", target)
     runtime_last["fps"] = _runtime_metric_or_cached(runtime_last.get("fps", "N/A"), cached_metrics["fps"], "fps", target)
+    LAST_VALID_RUNTIME_BY_DEVICE.setdefault(target, {})
+    for metric in ("cpu", "memory", "fps"):
+        value = runtime_last.get(metric, "N/A")
+        if isinstance(value, float):
+            LAST_VALID_RUNTIME_BY_DEVICE[target][metric] = value
     return runtime_last
 
 
@@ -440,31 +505,45 @@ def collect_performance_metrics(
     cpuinfo = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "cpuinfo", package_name], timeout=15, device_id=target)
     mem = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "meminfo", package_name], timeout=15, device_id=target)
     gfx = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "gfxinfo", package_name], timeout=20, device_id=target)
+    sf_latency = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "SurfaceFlinger", "--latency"], timeout=20, device_id=target)
 
     _debug_log(f"Raw TOP output:\n{top['output']}")
     _debug_log(f"Raw CPUINFO output:\n{cpuinfo['output']}")
     _debug_log(f"Raw MEMINFO output:\n{mem['output']}")
     _debug_log(f"Raw START output:\n{launch['output']}")
     _debug_log(f"Raw GFXINFO output:\n{gfx['output']}")
+    _debug_log(f"Raw SurfaceFlinger latency output:\n{sf_latency['output']}")
 
     cpu = parse_cpu_usage(top["output"], package_name) if top["success"] else "N/A"
     if cpu == "N/A" and cpuinfo["success"]:
         cpu = parse_cpu_usage_cpuinfo(cpuinfo["output"], package_name)
-    memory = parse_memory_mb(mem["output"]) if mem["success"] else "N/A"
+    memory_metrics = parse_memory_metrics(mem["output"]) if mem["success"] else {"total_mb": "N/A", "total_pss_mb": "N/A", "total_rss_mb": "N/A"}
+    memory = memory_metrics.get("total_mb", "N/A")
     launch_times = parse_launch_times(launch["output"]) if launch["success"] else {"ThisTime": "N/A", "TotalTime": "N/A", "WaitTime": "N/A"}
     fps = parse_fps(gfx["output"]) if gfx["success"] else "N/A"
+    if fps == "N/A" and sf_latency["success"]:
+        fps = parse_surfaceflinger_fps(sf_latency["output"])
 
+    cpu_status = "ok" if isinstance(cpu, float) else "missing"
+    memory_status = "ok" if isinstance(memory, float) else "missing"
+    fps_status = "ok" if isinstance(fps, float) and fps > 0 else ("abnormal_zero" if fps == 0.0 else "missing")
     if cpu == "N/A":
         _debug_log(f"[{target}] CPU parse unavailable (top success={top['success']}, cpuinfo success={cpuinfo['success']})")
     if memory == "N/A":
         _debug_log(f"[{target}] Memory parse unavailable (meminfo success={mem['success']})")
     if fps == "N/A":
-        _debug_log(f"[{target}] FPS parse unavailable (gfxinfo success={gfx['success']})")
+        _debug_log(f"[{target}] FPS parse unavailable (gfxinfo success={gfx['success']}, sf success={sf_latency['success']})")
+    _debug_log(
+        f"[{target}] Processed runtime metrics => cpu={cpu}, memory={memory}, fps={fps}, "
+        f"memory_metrics={memory_metrics}, statuses=(cpu={cpu_status}, memory={memory_status}, fps={fps_status})"
+    )
 
     return {
         "cpu": cpu,
         "memory": memory,
         "fps": fps,
+        "memory_metrics": memory_metrics,
+        "status": {"cpu": cpu_status, "memory": memory_status, "fps": fps_status},
         "launch_time": launch_times,
         "raw": {
             "top": top,
@@ -472,6 +551,7 @@ def collect_performance_metrics(
             "meminfo": mem,
             "start": launch,
             "gfxinfo": gfx,
+            "surfaceflinger_latency": sf_latency,
         },
     }
 
@@ -510,6 +590,8 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
             "memory": runtime.get("memory", "N/A"),
             "fps": runtime.get("fps", "N/A"),
             "gc_count": gc_count,
+            "memory_metrics": runtime.get("memory_metrics", {}),
+            "status": runtime.get("status", {}),
         },
         "startup_metrics": startup,
         "runtime_details": {
