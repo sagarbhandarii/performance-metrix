@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=10, help="Iterations per start type")
     parser.add_argument("--max-threads", type=int, default=4, help="Parallel install workers")
     parser.add_argument("--timeout", type=int, default=90, help="Install/launch adb timeout")
+    parser.add_argument("--output-dir", default="performance_runs", help="Base output directory for run artifacts")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     return parser.parse_args()
 
@@ -89,43 +92,58 @@ def stage_run_benchmarks(
     package_name: str,
     activity_name: str,
     iterations: int,
+    max_threads: int,
 ) -> Dict[str, Any]:
     LOGGER.info("Step 3/6: Run runtime + startup benchmarks")
     results: Dict[str, Any] = {}
 
+    def _failed_result(status: install_apk_parallel.DeviceExecutionStatus) -> Dict[str, Any]:
+        return {
+            "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
+            "startup_metrics": {
+                "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+            },
+            "runtime_details": {"launch_time": {}, "raw": {}},
+            "error": status.error or "install/launch failed",
+        }
+
+    successful: List[install_apk_parallel.DeviceExecutionStatus] = []
     for status in statuses:
         device_id = status.device_id
         if status.status != "success":
-            results[device_id] = {
-                "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
-                "startup_metrics": {
-                    "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                    "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                    "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                },
-                "runtime_details": {"launch_time": {}, "raw": {}},
-                "error": status.error or "install/launch failed",
-            }
+            results[device_id] = _failed_result(status)
             continue
+        successful.append(status)
 
-        try:
-            results[device_id] = performance_collector.run_full_benchmark(
+    workers = max(1, min(max_threads, len(successful)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(
+                performance_collector.run_full_benchmark,
                 status.target,
                 package_name,
                 activity_name,
-                iterations=iterations,
-            )
-        except Exception as error:
-            results[device_id] = {
-                "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
-                "startup_metrics": {
-                    "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                    "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                    "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                },
-                "runtime_details": {"launch_time": {}, "raw": {}},
-                "error": str(error),
-            }
+                iterations,
+            ): status.device_id
+            for status in successful
+        }
+        for future in as_completed(future_map):
+            device_id = future_map[future]
+            try:
+                results[device_id] = future.result()
+            except Exception as error:
+                results[device_id] = {
+                    "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
+                    "startup_metrics": {
+                        "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                        "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                        "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+                    },
+                    "runtime_details": {"launch_time": {}, "raw": {}},
+                    "error": str(error),
+                }
 
     return results
 
@@ -139,8 +157,9 @@ def stage_collect_and_save(results: Dict[str, Any]) -> Path:
 
 def stage_generate_report(results: Dict[str, Any]) -> Path:
     LOGGER.info("Step 5/6: Generate HTML report")
-    report_generator.generate_report_from_results(results, report_generator.OUTPUT_FILE)
-    return report_generator.OUTPUT_FILE.resolve()
+    report_file = performance_collector.FINAL_RESULTS_FILE.parent / "report.html"
+    report_generator.generate_report_from_results(results, report_file)
+    return report_file.resolve()
 
 
 def print_summary(total_devices: int, passed_devices: int, failed_devices: int, result_file: Path, report_file: Path) -> None:
@@ -154,6 +173,15 @@ def print_summary(total_devices: int, passed_devices: int, failed_devices: int, 
 
 def main() -> None:
     args = parse_args()
+    run_stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(args.output_dir) / f"run_{run_stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    logs_dir = run_dir / "logs"
+    logging_config.configure_logs_dir(logs_dir)
+    install_apk_parallel.set_logs_dir(logs_dir)
+    performance_collector.set_output_directory(run_dir)
+
     logging_config.setup_logging(args.debug)
     performance_collector.set_debug(args.debug)
 
@@ -171,7 +199,7 @@ def main() -> None:
         )
         statuses = [status for status in statuses if status.device_id == active_devices[0]]
 
-    results = stage_run_benchmarks(statuses, args.package, args.activity, args.iterations)
+    results = stage_run_benchmarks(statuses, args.package, args.activity, args.iterations, args.max_threads)
     result_file = stage_collect_and_save(results)
     report_file = stage_generate_report(results)
 

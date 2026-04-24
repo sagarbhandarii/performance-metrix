@@ -16,6 +16,14 @@ from typing import Dict, Iterable, List, Optional
 import device_registry
 import logging_config
 
+LOGS_DIR = Path("logs")
+
+
+def set_logs_dir(path: Path) -> None:
+    """Configure device-level execution logs directory."""
+    global LOGS_DIR
+    LOGS_DIR = path
+
 
 @dataclass
 class DeviceExecutionStatus:
@@ -56,7 +64,7 @@ def run_adb_command(
     device_id: str,
 ) -> subprocess.CompletedProcess[str]:
     """Run adb command and raise descriptive errors for common failure modes."""
-    log_path = Path("logs") / f"{device_id.replace(':', '_')}.log"
+    log_path = LOGS_DIR / f"{device_id.replace(':', '_')}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info("Running on device: %s", device_id)
     logger.debug("Running command: %s", " ".join(command))

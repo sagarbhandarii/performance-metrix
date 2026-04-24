@@ -13,6 +13,13 @@ LOG_FILE = LOGS_DIR / f"test_run_{RUN_TIMESTAMP}.log"
 _INITIALIZED = False
 
 
+def configure_logs_dir(logs_dir: Path) -> None:
+    """Set logging output directory before setup_logging is called."""
+    global LOGS_DIR, LOG_FILE
+    LOGS_DIR = logs_dir
+    LOG_FILE = LOGS_DIR / f"test_run_{RUN_TIMESTAMP}.log"
+
+
 def setup_logging(verbose: bool = False) -> Path:
     """Initialize root logging handlers for console + timestamped file."""
     global _INITIALIZED
