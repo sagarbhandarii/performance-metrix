@@ -23,7 +23,7 @@ def run_command(command: List[str], device_id: Optional[str] = None) -> subproce
 
 def get_connected_devices() -> List[str]:
     """Return a list of USB-connected and online device ids from adb devices output."""
-    result = run_command(["adb", "devices"])
+    result = run_command(["adb", "devices", "-l"])
     if result.returncode != 0:
         LOGGER.error("Failed to list adb devices: %s", result.stderr.strip())
         raise RuntimeError(f"Failed to list adb devices: {result.stderr.strip()}")
@@ -38,8 +38,17 @@ def get_connected_devices() -> List[str]:
             continue
 
         device_id, state = parts[0], parts[1]
-        if state == "device":
+        # Only include physical USB devices. This skips mDNS/TLS entries like:
+        # adb-<serial>-<token>._adb-tls-connect._tcp
+        # and network targets like <ip>:5555.
+        is_usb_transport = " usb:" in f" {line} "
+        is_wireless_serial = ".adb-tls-connect._tcp" in device_id or ":" in device_id
+
+        if state == "device" and is_usb_transport and not is_wireless_serial:
             devices.append(device_id)
+        elif state == "device":
+            print(f"[{device_id}] Skipping: not a USB transport")
+            LOGGER.info("[%s] Skipping non-USB transport entry", device_id)
         elif state == "offline":
             print(f"[{device_id}] Skipping: device is offline")
             LOGGER.error("[%s] Skipping offline device", device_id)
@@ -66,6 +75,8 @@ def enable_tcpip(device_id: str, port: int) -> bool:
 def get_device_ip(device_id: str) -> Optional[str]:
     """Get Wi-Fi IPv4 address from Android device shell."""
     commands = [
+        ["adb", "-s", device_id, "shell", "getprop", "dhcp.wlan0.ipaddress"],
+        ["adb", "-s", device_id, "shell", "ip", "-f", "inet", "addr", "show"],
         ["adb", "-s", device_id, "shell", "ip", "route"],
         ["adb", "-s", device_id, "shell", "ip", "addr", "show", "wlan0"],
         ["adb", "-s", device_id, "shell", "ifconfig", "wlan0"],
@@ -80,7 +91,7 @@ def get_device_ip(device_id: str) -> Optional[str]:
 
         candidates = ip_pattern.findall(result.stdout)
         for candidate in candidates:
-            if candidate.startswith("127."):
+            if candidate.startswith(("127.", "0.")):
                 continue
             octets = [int(part) for part in candidate.split(".")]
             if all(0 <= octet <= 255 for octet in octets):
@@ -88,8 +99,8 @@ def get_device_ip(device_id: str) -> Optional[str]:
                 LOGGER.info("[%s] Found IP address: %s", device_id, candidate)
                 return candidate
 
-    print(f"[{device_id}] Error: no IP address found")
-    LOGGER.error("[%s] No IP address found", device_id)
+    print(f"[{device_id}] Error: no IP address found (is Wi-Fi connected on the device?)")
+    LOGGER.error("[%s] No IP address found. Ensure Wi-Fi is enabled and connected.", device_id)
     return None
 
 
