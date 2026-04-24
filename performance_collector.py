@@ -282,9 +282,9 @@ def parse_memory_mb(meminfo_output: str) -> MetricValue:
 def parse_launch_times(start_output: str) -> Dict[str, Union[int, str]]:
     result: Dict[str, Union[int, str]] = {"ThisTime": "N/A", "TotalTime": "N/A", "WaitTime": "N/A"}
     for key in result:
-        match = re.search(rf"{key}:\s*(\d+)", start_output, flags=re.IGNORECASE)
+        match = re.search(rf"{key}:\s*([0-9][0-9,]*)", start_output, flags=re.IGNORECASE)
         if match:
-            result[key] = int(match.group(1))
+            result[key] = int(match.group(1).replace(",", ""))
     _debug_log(f"Parsed launch times => {result}")
     return result
 
