@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -176,6 +178,39 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
     }
 
 
+def _build_kpis(
+    summary: Dict[str, str],
+    runtime_rows: List[Dict[str, Any]],
+    device_rows: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    avg_cpu = _avg([row["cpu"] for row in runtime_rows if isinstance(row.get("cpu"), float)])
+    avg_memory = _avg([row["memory"] for row in runtime_rows if isinstance(row.get("memory"), float)])
+    avg_fps = _avg([row["fps"] for row in runtime_rows if isinstance(row.get("fps"), float)])
+    test_count = len(device_rows)
+
+    return {
+        "fastest": summary.get("fastest", "N/A"),
+        "slowest": summary.get("slowest", "N/A"),
+        "overall": summary.get("overall", "N/A"),
+        "avg_cpu": f"{avg_cpu:.1f}%" if avg_cpu is not None else "No Data",
+        "avg_memory": f"{avg_memory:.1f} MB" if avg_memory is not None else "No Data",
+        "avg_fps": f"{avg_fps:.1f}" if avg_fps is not None else "No Data",
+        "total_devices": str(test_count),
+    }
+
+
+def _estimate_test_duration(startup_rows: List[Dict[str, Any]]) -> str:
+    startup_samples = 0
+    for row in startup_rows:
+        startup_samples += len(row.get("cold_values", []))
+        startup_samples += len(row.get("warm_values", []))
+        startup_samples += len(row.get("hot_values", []))
+    if startup_samples <= 0:
+        return "Unknown (insufficient timing data)"
+    seconds = startup_samples * 2
+    minutes, remaining_seconds = divmod(seconds, 60)
+    return f"~{minutes}m {remaining_seconds}s (estimated)"
+
 
 
 def _build_insights(runtime_rows: List[Dict[str, Any]], startup_rows: List[Dict[str, Any]]) -> List[str]:
@@ -206,23 +241,23 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "<tr><td colspan=\"6\">No runtime data available</td></tr>"
 
-    def _perf_class_cpu(cpu: float | None) -> str:
+    def _cpu_class(cpu: float | None) -> str:
         if not isinstance(cpu, float):
             return ""
-        if cpu > 70:
-            return "metric-bad"
-        if cpu < 40:
-            return "metric-good"
-        return "metric-medium"
+        if cpu > 80:
+            return "metric-critical"
+        if cpu > 60:
+            return "metric-warning"
+        return "metric-good"
 
-    def _perf_class_fps(fps: float | None) -> str:
+    def _fps_class(fps: float | None) -> str:
         if not isinstance(fps, float):
             return ""
-        if fps >= 55:
-            return "metric-good"
-        if fps >= 35:
-            return "metric-medium"
-        return "metric-bad"
+        if fps < 30:
+            return "metric-critical"
+        if fps < 45:
+            return "metric-warning"
+        return "metric-good"
 
     rows_html: List[str] = []
     def _display_metric(value: float | None, status: str) -> str:
@@ -235,14 +270,22 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
         return "N/A"
 
     for row in rows:
+        cpu_value = _display_metric(row["cpu"], row.get("cpu_status", "missing"))
+        memory_value = _display_metric(row["memory"], row.get("memory_status", "missing"))
+        fps_value = _display_metric(row["fps"], row.get("fps_status", "missing"))
+        cpu_cell = cpu_value if cpu_value != "N/A" else '<span class="badge badge-neutral">No Data</span>'
+        memory_cell = memory_value if memory_value != "N/A" else '<span class="badge badge-neutral">No Data</span>'
+        fps_cell = fps_value if fps_value != "N/A" else '<span class="badge badge-neutral">No Data</span>'
+        gc_cell = _fmt_num(row["gc_count"], 0) if isinstance(row["gc_count"], float) else '<span class="badge badge-neutral">No Data</span>'
+        status_cell = f'<span class="badge badge-critical">{escape(row["error"])}</span>' if row["error"] else '<span class="badge badge-good">Healthy</span>'
         rows_html.append(
             "<tr>"
             f"<td>{escape(row['device'])}</td>"
-            f"<td class=\"{_perf_class_cpu(row['cpu'])}\">{_display_metric(row['cpu'], row.get('cpu_status', 'missing'))}</td>"
-            f"<td>{_display_metric(row['memory'], row.get('memory_status', 'missing'))}</td>"
-            f"<td class=\"{_perf_class_fps(row['fps'])}\">{_display_metric(row['fps'], row.get('fps_status', 'missing'))}</td>"
-            f"<td>{_fmt_num(row['gc_count'], 0)}</td>"
-            f"<td class=\"{'metric-bad' if row['error'] else 'metric-good'}\">{escape(row['error']) if row['error'] else 'None'}</td>"
+            f"<td class=\"{_cpu_class(row['cpu'])}\" title=\"CPU usage percentage during runtime. >60% indicates elevated load.\">{cpu_cell}</td>"
+            f"<td title=\"Average memory usage in MB while app is active.\">{memory_cell}</td>"
+            f"<td class=\"{_fps_class(row['fps'])}\" title=\"Frames per second. Values below 30 FPS are critical for smooth UX.\">{fps_cell}</td>"
+            f"<td title=\"Garbage collection cycles observed during sampling.\">{gc_cell}</td>"
+            f"<td>{status_cell}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
@@ -258,8 +301,8 @@ def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
         if startup_ms <= 2000:
             return "metric-good"
         if startup_ms <= 3500:
-            return "metric-medium"
-        return "metric-bad"
+            return "metric-warning"
+        return "metric-critical"
 
     rows_html: List[str] = []
     for row in rows:
@@ -276,29 +319,36 @@ def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
 
 def _device_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "<tr><td colspan=\"9\">No device details available</td></tr>"
+        return '<div class="empty-state">No device details available</div>'
 
     lines: List[str] = []
     for row in rows:
         os_label = row["android_version"]
         if row["sdk_int"] != "N/A":
             os_label = f"{os_label} (SDK {row['sdk_int']})"
+        status_class = "status-down" if row["error"] else "status-up"
+        status_text = "Issue detected" if row["error"] else "Healthy"
+        memory_text = f"{_fmt_num(row['total_memory_mb'])} MB RAM" if isinstance(row["total_memory_mb"], float) else "No Data MB RAM"
+        error_html = f'<p class="device-error">{escape(row["error"])}</p>' if row["error"] else ""
         lines.append(
-            "<tr>"
-            f"<td>{escape(row['device'])}</td>"
-            f"<td>{escape(row['model'])}</td>"
-            f"<td>{escape(row['manufacturer'])}</td>"
-            f"<td>{escape(os_label)}</td>"
-            f"<td>{escape(row['cpu'])}</td>"
-            f"<td>{_fmt_num(row['total_memory_mb'])}</td>"
-            f"<td class=\"mono\">{escape(row['build_fingerprint'])}</td>"
-            f"<td class=\"{'metric-bad' if row['error'] else 'metric-good'}\">{escape(row['error']) if row['error'] else 'OK'}</td>"
-            "</tr>"
+            '<article class="device-card">'
+            '<div class="device-card-header">'
+            f"<div><h3>{escape(row['device'])}</h3><p>{escape(row['manufacturer'])} · {escape(row['model'])}</p></div>"
+            f"<span class=\"status-pill {status_class}\"><span class=\"status-dot\"></span>{status_text}</span>"
+            "</div>"
+            '<div class="device-meta">'
+            f"<span class=\"badge badge-neutral\">OS {escape(os_label)}</span>"
+            f"<span class=\"badge badge-neutral\">{escape(row['cpu'])}</span>"
+            f"<span class=\"badge badge-neutral\">{memory_text}</span>"
+            "</div>"
+            f"<p class=\"mono\">{escape(row['build_fingerprint'])}</p>"
+            f"{error_html}"
+            "</article>"
         )
     return "\n".join(lines)
 
 
-def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _chart_payload(startup_rows: List[Dict[str, Any]], runtime_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     cold_avg = _avg([row["cold_avg"] for row in startup_rows if isinstance(row["cold_avg"], float)])
     warm_avg = _avg([row["warm_avg"] for row in startup_rows if isinstance(row["warm_avg"], float)])
     hot_avg = _avg([row["hot_avg"] for row in startup_rows if isinstance(row["hot_avg"], float)])
@@ -328,6 +378,10 @@ def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         for row in startup_rows
     ]
 
+    runtime_labels = [row["device"] for row in runtime_rows]
+    cpu_values = [round(row["cpu"], 2) if isinstance(row["cpu"], float) else None for row in runtime_rows]
+    memory_values = [round(row["memory"], 2) if isinstance(row["memory"], float) else None for row in runtime_rows]
+
     return {
         "startup_metrics": {
             "cold": {"avg": round(cold_avg, 2) if cold_avg is not None else None, "values": _pad_nullable(cold_values, max_points)},
@@ -336,10 +390,21 @@ def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             "labels": list(range(1, max_points + 1)),
         },
         "device_metrics": {"labels": device_labels, "startup_avg_ms": device_avg_values},
+        "runtime_metrics": {"labels": runtime_labels, "cpu_percent": cpu_values, "memory_mb": memory_values},
     }
 
 
-def _html_report(summary: Dict[str, str], insights_html: str, runtime_rows: str, startup_rows: str, device_rows: str, chart_data_json: str) -> str:
+def _html_report(
+    kpis: Dict[str, str],
+    insights_html: str,
+    runtime_rows: str,
+    startup_rows: str,
+    device_rows: str,
+    chart_data_json: str,
+    generated_at: str,
+    test_duration: str,
+    environment: str,
+) -> str:
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -347,127 +412,129 @@ def _html_report(summary: Dict[str, str], insights_html: str, runtime_rows: str,
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />
   <title>Unified Android Performance Report</title>
   <style>
-    body {{
-      font-family: Arial, sans-serif;
-      background: #f5f7fa;
-      margin: 0;
-      padding: 20px;
-      color: #1f2937;
+    :root {{
+      --bg: #0b1220;
+      --surface: #111a2e;
+      --surface-soft: #162239;
+      --text: #e5edf9;
+      --muted: #93a2be;
+      --line: #253454;
+      --good: #22c55e;
+      --warn: #f59e0b;
+      --critical: #ef4444;
+      --accent: #60a5fa;
     }}
-
+    body {{
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: radial-gradient(circle at top, #16233f 0%, #0b1220 60%);
+      margin: 0;
+      padding: 24px;
+      color: var(--text);
+    }}
     .container {{
-      max-width: 1200px;
+      max-width: 1280px;
       margin: 0 auto;
     }}
-
     .card {{
-      background: white;
-      padding: 22px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 20px;
       margin-bottom: 18px;
-      border-radius: 12px;
-      box-shadow: 0 6px 24px rgba(15,23,42,0.08);
-      border: 1px solid #e5e7eb;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.25);
+      transition: transform .2s ease, box-shadow .2s ease;
     }}
-
+    .card:hover {{
+      transform: translateY(-2px);
+      box-shadow: 0 16px 38px rgba(0, 0, 0, 0.32);
+    }}
     h1 {{
-      text-align: center;
-      margin-bottom: 30px;
+      margin: 0 0 6px;
+      font-size: 30px;
     }}
-
     h2 {{
-      margin-top: 0;
-      margin-bottom: 16px;
+      margin: 0 0 12px;
+      font-size: 20px;
     }}
-
+    .subtitle {{
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    .header-bar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }}
+    .meta {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }}
+    .badge-neutral {{ background: rgba(147, 162, 190, .14); color: #d7e1f5; border-color: rgba(147, 162, 190, .24); }}
+    .badge-good {{ background: rgba(34,197,94,.18); color: #aff7c8; border-color: rgba(34,197,94,.3); }}
+    .badge-warn {{ background: rgba(245,158,11,.18); color: #ffe0a5; border-color: rgba(245,158,11,.3); }}
+    .badge-critical {{ background: rgba(239,68,68,.18); color: #ffc0c0; border-color: rgba(239,68,68,.3); }}
+    .kpi-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+      gap: 14px;
+    }}
+    .kpi-card {{
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+    }}
+    .kpi-card .label {{ font-size: 12px; color: var(--muted); margin-bottom: 8px; display: block; }}
+    .kpi-card .value {{ font-size: 24px; font-weight: 800; letter-spacing: .2px; }}
+    .kpi-card small {{ color: var(--muted); font-size: 12px; }}
     table {{
       width: 100%;
       border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 12px;
+      border: 1px solid var(--line);
     }}
-
     th {{
-      background: #0f766e;
-      color: white;
-      padding: 10px;
+      background: rgba(96,165,250,.15);
+      color: #cfe3ff;
+      padding: 11px;
+      font-size: 13px;
       text-align: left;
     }}
-
     td {{
-      padding: 10px;
-      border-bottom: 1px solid #ddd;
+      padding: 11px;
+      border-bottom: 1px solid var(--line);
       vertical-align: top;
     }}
-
-    .summary {{
-      display: flex;
-      gap: 20px;
-    }}
-
-    .summary-card {{
-      flex: 1;
-      background: #ffffff;
-      padding: 15px;
-      border-radius: 10px;
-      text-align: center;
-      font-weight: bold;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-      border-top: 4px solid #4CAF50;
-    }}
-    .mono {{
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      font-size: 12px;
-      word-break: break-all;
-      color: #475569;
-    }}
-    .section-subtitle {{
-      color: #64748b;
-      margin: -4px 0 14px;
-      font-size: 14px;
-    }}
-
-    .summary-card .label {{
-      display: block;
-      font-size: 14px;
-      color: #6b7280;
-      margin-bottom: 8px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-    }}
-
-    .summary-card .value {{
-      display: block;
-      font-size: 18px;
-      color: #111827;
-    }}
-
-    .metric-good {{
-      color: #15803d;
-      font-weight: 700;
-    }}
-
-    .metric-medium {{
-      color: #c2410c;
-      font-weight: 700;
-    }}
-
-    .metric-bad {{
-      color: #b91c1c;
-      font-weight: 700;
-    }}
-
+    .metric-good {{ color: var(--good); font-weight: 700; }}
+    .metric-warning {{ color: var(--warn); font-weight: 700; }}
+    .metric-critical {{ color: var(--critical); font-weight: 700; }}
     .chart-wrap {{
       display: grid;
-      gap: 20px;
+      gap: 14px;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     }}
-
     .chart-panel {{
-      background: #fafafa;
-      border: 1px solid #eceff3;
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
       border-radius: 10px;
       padding: 12px;
     }}
-
     .chart-panel h3 {{
       margin: 0 0 12px;
       font-size: 16px;
@@ -484,12 +551,12 @@ def _html_report(summary: Dict[str, str], insights_html: str, runtime_rows: str,
       justify-content: center;
       min-height: 340px;
       text-align: center;
-      color: #6b7280;
+      color: var(--muted);
       font-size: 14px;
-      border: 1px dashed #d1d5db;
+      border: 1px dashed var(--line);
       border-radius: 8px;
       padding: 12px;
-      background: #ffffff;
+      background: rgba(11,18,32,.4);
     }}
 
     .chart-panel.no-data canvas,
@@ -503,98 +570,127 @@ def _html_report(summary: Dict[str, str], insights_html: str, runtime_rows: str,
     }}
 
     .chart-panel.error .chart-message {{
-      color: #b91c1c;
-      border-color: #fecaca;
-      background: #fff1f2;
+      color: #ffb3b3;
+      border-color: rgba(239,68,68,.5);
+      background: rgba(239,68,68,.12);
       font-weight: 600;
     }}
-
-    canvas {{
-      width: 100%;
-      height: 340px;
+    .insight-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
     }}
-
+    .insight-card {{
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: var(--surface-soft);
+    }}
+    .insight-card.warning {{ border-left: 4px solid var(--warn); }}
+    .insight-card.critical {{ border-left: 4px solid var(--critical); }}
+    .insight-card.healthy {{ border-left: 4px solid var(--good); }}
+    .device-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+    }}
+    .device-card {{
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      margin: 0;
+    }}
+    .device-card-header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }}
+    .device-card h3 {{ margin: 0; font-size: 15px; }}
+    .device-card p {{ margin: 2px 0 0; color: var(--muted); font-size: 13px; }}
+    .device-meta {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 10px; }}
+    .status-pill {{ display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; }}
+    .status-dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
+    .status-up .status-dot {{ background: var(--good); box-shadow: 0 0 0 2px rgba(34,197,94,.2); }}
+    .status-down .status-dot {{ background: var(--critical); box-shadow: 0 0 0 2px rgba(239,68,68,.2); }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; word-break: break-all; color: #9db1d1; }}
+    .device-error {{ color: #ffb3b3 !important; margin-top: 8px !important; }}
+    canvas {{ width: 100%; height: 340px; }}
+    .table-wrap {{ overflow-x: auto; }}
     @media (max-width: 768px) {{
-      .summary {{
-        flex-direction: column;
-      }}
+      body {{ padding: 12px; }}
+      .kpi-card .value {{ font-size: 20px; }}
     }}
   </style>
 </head>
 <body>
 <div class=\"container\">
-  <h1>Unified Android Performance Report</h1>
+  <div class=\"header-bar\">
+    <div>
+      <h1>Android Performance Analytics</h1>
+      <p class=\"subtitle\">Production-style runtime and startup benchmarking dashboard.</p>
+    </div>
+    <div class=\"meta\">
+      <span class=\"badge badge-neutral\">Generated: {escape(generated_at)}</span>
+      <span class=\"badge badge-neutral\">Duration: {escape(test_duration)}</span>
+      <span class=\"badge badge-good\">Env: {escape(environment)}</span>
+    </div>
+  </div>
 
 <div class=\"card\">
-  <h2>Summary</h2>
-  <div class=\"summary\">
-    <div class=\"summary-card\">
-      <span class=\"label\">Fastest Device</span>
-      <span class=\"value\">{summary['fastest']}</span>
-    </div>
-    <div class=\"summary-card\">
-      <span class=\"label\">Slowest Device</span>
-      <span class=\"value\">{summary['slowest']}</span>
-    </div>
-    <div class=\"summary-card\">
-      <span class=\"label\">Avg Time</span>
-      <span class=\"value\">{summary['overall']}</span>
-    </div>
-</div>
+  <h2>KPI Summary</h2>
+  <div class=\"kpi-grid\">
+    <div class=\"kpi-card\"><span class=\"label\">🚀 Fastest Device</span><span class=\"value\">{kpis['fastest']}</span><small>Lowest average startup time</small></div>
+    <div class=\"kpi-card\"><span class=\"label\">🐢 Slowest Device</span><span class=\"value\">{kpis['slowest']}</span><small>Highest average startup time</small></div>
+    <div class=\"kpi-card\"><span class=\"label\">📊 Avg Startup</span><span class=\"value\">{kpis['overall']}</span><small>Overall launch latency</small></div>
+    <div class=\"kpi-card\"><span class=\"label\">Avg CPU</span><span class=\"value\">{kpis['avg_cpu']}</span><small>Mean runtime CPU utilization</small></div>
+    <div class=\"kpi-card\"><span class=\"label\">Avg Memory</span><span class=\"value\">{kpis['avg_memory']}</span><small>Mean memory footprint</small></div>
+    <div class=\"kpi-card\"><span class=\"label\">Avg FPS</span><span class=\"value\">{kpis['avg_fps']}</span><small>Rendering smoothness index</small></div>
+    <div class=\"kpi-card\"><span class=\"label\">Total Devices Tested</span><span class=\"value\">{kpis['total_devices']}</span><small>Devices included in report</small></div>
+  </div>
 </div>
 
 <div class=\"card\">
   <h2>Insights</h2>
-  <ul>
+  <div class=\"insight-grid\">
     {insights_html}
-  </ul>
+  </div>
 </div>
 
 <div class=\"card\">
   <h2>Device Details</h2>
-  <p class=\"section-subtitle\">Hardware/OS details for each tested device (quickly identify environment differences).</p>
-  <table>
-    <tr>
-      <th>Device ID</th>
-      <th>Model</th>
-      <th>Manufacturer</th>
-      <th>OS Version</th>
-      <th>CPU ABI</th>
-      <th>Total Memory (MB)</th>
-      <th>Build Fingerprint</th>
-      <th>Status</th>
-    </tr>
-    {device_rows}
-  </table>
+  <p class=\"subtitle\">Hardware and OS context for each tested target.</p>
+  <div class=\"device-grid\">{device_rows}</div>
 </div>
 
 <div class=\"card\">
   <h2>Runtime Performance</h2>
-  <p class=\"section-subtitle\">Critical runtime metrics. Error column highlights failed/invalid runs.</p>
-  <table>
+  <p class=\"subtitle\">Tooltips explain each metric. FPS below 30 is marked critical.</p>
+  <div class=\"table-wrap\"><table>
     <tr>
-      <th>Device</th>
-      <th>CPU %</th>
-      <th>Memory (MB)</th>
-      <th>FPS</th>
-      <th>GC Count</th>
-      <th>Error</th>
+      <th title=\"Unique test device identifier\">Device</th>
+      <th title=\"CPU load percentage while running scenario\">CPU (%)</th>
+      <th title=\"Average resident memory usage\">Memory (MB)</th>
+      <th title=\"Frames per second under workload\">FPS</th>
+      <th title=\"Garbage collection cycles observed\">GC Count</th>
+      <th title=\"Collection and runtime state\">Status</th>
     </tr>
     {runtime_rows}
-  </table>
+  </table></div>
 </div>
 
 <div class=\"card\">
   <h2>Startup Performance</h2>
-  <table>
+  <div class=\"table-wrap\"><table>
     <tr>
       <th>Device</th>
-      <th>Cold Avg</th>
-      <th>Warm Avg</th>
-      <th>Hot Avg</th>
+      <th title=\"Initial app launch after process cold start\">Cold Avg (ms)</th>
+      <th title=\"App relaunch with cached process\">Warm Avg (ms)</th>
+      <th title=\"App relaunch from hot state\">Hot Avg (ms)</th>
     </tr>
     {startup_rows}
-  </table>
+  </table></div>
 </div>
 
 <div class=\"card\">
@@ -621,6 +717,13 @@ def _html_report(summary: Dict[str, str], insights_html: str, runtime_rows: str,
         <div class=\"chart-message\" id=\"deviceChartMessage\">No data available.</div>
       </div>
     </div>
+    <div class=\"chart-panel\" id=\"resourcePanel\">
+      <h3>CPU vs Memory by Device</h3>
+      <div class=\"chart-container\">
+        <canvas id=\"resourceChart\"></canvas>
+        <div class=\"chart-message\" id=\"resourceChartMessage\">No data available.</div>
+      </div>
+    </div>
   </div>
 </div>
 </div>
@@ -634,9 +737,11 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
   const ctx = document.getElementById(\"barChart\");
   const ctx2 = document.getElementById(\"lineChart\");
   const ctx3 = document.getElementById(\"deviceChart\");
+  const ctx4 = document.getElementById(\"resourceChart\");
   const barPanel = document.getElementById(\"barPanel\");
   const linePanel = document.getElementById(\"linePanel\");
   const devicePanel = document.getElementById(\"devicePanel\");
+  const resourcePanel = document.getElementById(\"resourcePanel\");
 
   function setPanelMessage(panel, message, isError) {{
     if (!panel) return;
@@ -657,11 +762,12 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
     return values.some((value) => typeof value === 'number' && value > 0);
   }}
 
-  if (!ctx || !ctx2 || !ctx3) {{
+  if (!ctx || !ctx2 || !ctx3 || !ctx4) {{
     console.error(`${{reportPrefix}} Missing canvas elements for chart rendering.`);
     setPanelMessage(barPanel, 'Chart container is unavailable.', true);
     setPanelMessage(linePanel, 'Chart container is unavailable.', true);
     setPanelMessage(devicePanel, 'Chart container is unavailable.', true);
+    setPanelMessage(resourcePanel, 'Chart container is unavailable.', true);
     return;
   }}
 
@@ -670,6 +776,7 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
     setPanelMessage(barPanel, 'Unable to load chart library.', true);
     setPanelMessage(linePanel, 'Unable to load chart library.', true);
     setPanelMessage(devicePanel, 'Unable to load chart library.', true);
+    setPanelMessage(resourcePanel, 'Unable to load chart library.', true);
     return;
   }}
 
@@ -684,6 +791,9 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
 
   const labels = Array.isArray(data.device_metrics?.labels) ? data.device_metrics.labels : [];
   const values = toNumberArray(data.device_metrics?.startup_avg_ms).filter((value) => typeof value === 'number');
+  const runtimeLabels = Array.isArray(data.runtime_metrics?.labels) ? data.runtime_metrics.labels : [];
+  const runtimeCpu = toNumberArray(data.runtime_metrics?.cpu_percent);
+  const runtimeMemory = toNumberArray(data.runtime_metrics?.memory_mb);
 
   try {{
     if (hasPositiveValue(barValues)) {{
@@ -694,7 +804,8 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
           datasets: [{{
             label: 'Avg Launch Time',
             data: barValues,
-            backgroundColor: ['#ef4444', '#f59e0b', '#22c55e']
+            backgroundColor: ['rgba(239,68,68,.65)', 'rgba(245,158,11,.65)', 'rgba(34,197,94,.65)'],
+            borderRadius: 8
           }}]
         }},
         options: {{
@@ -703,6 +814,9 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
           layout: {{ padding: 12 }},
           plugins: {{
             legend: {{ display: true, position: 'top' }}
+          }},
+          scales: {{
+            y: {{ title: {{ display: true, text: 'Milliseconds (ms)' }} }}
           }}
         }}
       }});
@@ -722,9 +836,9 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
         data: {{
           labels: Array.isArray(startupMetrics?.labels) ? startupMetrics.labels : [],
           datasets: [
-            {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', fill: false }},
-            {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', fill: false }},
-            {{ label: 'Hot', data: hotTrend, borderColor: '#22c55e', fill: false }}
+            {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', tension: 0.35, fill: false }},
+            {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', tension: 0.35, fill: false }},
+            {{ label: 'Hot', data: hotTrend, borderColor: '#22c55e', tension: 0.35, fill: false }}
           ]
         }},
         options: {{
@@ -733,6 +847,10 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
           layout: {{ padding: 12 }},
           plugins: {{
             legend: {{ display: true, position: 'top' }}
+          }},
+          scales: {{
+            x: {{ title: {{ display: true, text: 'Run Iteration' }} }},
+            y: {{ title: {{ display: true, text: 'Startup Time (ms)' }} }}
           }}
         }}
       }});
@@ -754,7 +872,8 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
           datasets: [{{
             label: 'Avg Startup (ms)',
             data: values,
-            backgroundColor: '#3b82f6'
+            backgroundColor: 'rgba(96,165,250,.7)',
+            borderRadius: 8
           }}]
         }},
         options: {{
@@ -764,6 +883,9 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
           layout: {{ padding: 12 }},
           plugins: {{
             legend: {{ display: true, position: 'top' }}
+          }},
+          scales: {{
+            x: {{ title: {{ display: true, text: 'Milliseconds (ms)' }} }}
           }}
         }}
       }});
@@ -774,6 +896,35 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
   }} catch (error) {{
     console.error(`${{reportPrefix}} Failed to render device startup chart.`, error);
     setPanelMessage(devicePanel, 'Unable to render chart.', true);
+  }}
+
+  try {{
+    if (runtimeLabels.length && hasPositiveValue(runtimeCpu) && hasPositiveValue(runtimeMemory)) {{
+      new Chart(ctx4, {{
+        type: 'bar',
+        data: {{
+          labels: runtimeLabels,
+          datasets: [
+            {{ label: 'CPU (%)', data: runtimeCpu, backgroundColor: 'rgba(245,158,11,.7)', yAxisID: 'y' }},
+            {{ label: 'Memory (MB)', data: runtimeMemory, backgroundColor: 'rgba(34,197,94,.6)', yAxisID: 'y1' }}
+          ]
+        }},
+        options: {{
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {{ legend: {{ display: true, position: 'top' }} }},
+          scales: {{
+            y: {{ type: 'linear', position: 'left', title: {{ display: true, text: 'CPU (%)' }} }},
+            y1: {{ type: 'linear', position: 'right', title: {{ display: true, text: 'Memory (MB)' }}, grid: {{ drawOnChartArea: false }} }}
+          }}
+        }}
+      }});
+    }} else {{
+      setPanelMessage(resourcePanel, 'No runtime CPU/Memory data available.', false);
+    }}
+  }} catch (error) {{
+    console.error(`${{reportPrefix}} Failed to render resource chart.`, error);
+    setPanelMessage(resourcePanel, 'Unable to render chart.', true);
   }}
 }});
 </script>
@@ -792,13 +943,27 @@ def generate_report_from_results(results: Dict[str, Any], output_file: Path = OU
 
     summary = _build_summary(startup_data)
     insights = _build_insights(runtime_data, startup_data)
-    insights_html = "\n".join(f"<li>{escape(item)}</li>" for item in insights)
+    def _insight_card(item: str) -> str:
+        normalized = item.lower()
+        if "no major anomalies" in normalized or "healthy" in normalized:
+            icon, style = "✅", "healthy"
+        elif "error" in normalized or "low fps" in normalized:
+            icon, style = "❌", "critical"
+        else:
+            icon, style = "⚠️", "warning"
+        return f'<article class="insight-card {style}"><strong>{icon}</strong> {escape(item)}</article>'
+
+    insights_html = "\n".join(_insight_card(item) for item in insights)
     runtime_rows = _runtime_rows_html(runtime_data)
     startup_rows = _startup_rows_html(startup_data)
     device_rows = _device_rows_html(device_data)
-    chart_data_json = json.dumps(_chart_payload(startup_data))
+    chart_data_json = json.dumps(_chart_payload(startup_data, runtime_data))
+    kpis = _build_kpis(summary, runtime_data, device_data)
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    test_duration = _estimate_test_duration(startup_data)
+    environment = os.environ.get("REPORT_ENV", "QA")
 
-    html = _html_report(summary, insights_html, runtime_rows, startup_rows, device_rows, chart_data_json)
+    html = _html_report(kpis, insights_html, runtime_rows, startup_rows, device_rows, chart_data_json, generated_at, test_duration, environment)
     output_file.write_text(html, encoding="utf-8")
     LOGGER.info("Report generated: %s", output_file)
     return output_file
