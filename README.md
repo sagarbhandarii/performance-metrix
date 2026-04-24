@@ -195,6 +195,7 @@ Optional arguments:
 
 ```bash
 --max-threads 4 --timeout 90 --output-dir performance_runs --debug
+--runtime-window 60 --sample-interval 5 --adb-retries 1 --quick
 ```
 
 ## Execution flow (what happens internally)

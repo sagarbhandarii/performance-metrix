@@ -6,12 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Union
 
+import adb_client
 import device_registry
 import logging_config
 
@@ -25,6 +25,7 @@ DEBUG_MODE = False
 MetricValue = Union[float, str]
 RUNTIME_OBSERVATION_WINDOW_SECONDS = 60
 CPU_SAMPLE_INTERVAL_SECONDS = 5
+ADB_RETRY_COUNT = 1
 
 
 def set_debug(enabled: bool) -> None:
@@ -42,6 +43,18 @@ def set_output_directory(output_dir: Path) -> None:
     FINAL_RESULTS_FILE = output_dir / "final_results.json"
     LOGS_DIR = output_dir / "logs"
     DEBUG_LOG_FILE = LOGS_DIR / "debug.txt"
+
+
+def set_runtime_collection(window_seconds: int, sample_interval_seconds: int) -> None:
+    """Tune runtime observation duration and sample interval."""
+    global RUNTIME_OBSERVATION_WINDOW_SECONDS, CPU_SAMPLE_INTERVAL_SECONDS
+    RUNTIME_OBSERVATION_WINDOW_SECONDS = max(5, window_seconds)
+    CPU_SAMPLE_INTERVAL_SECONDS = max(1, sample_interval_seconds)
+
+
+def set_adb_retries(retries: int) -> None:
+    global ADB_RETRY_COUNT
+    ADB_RETRY_COUNT = max(0, retries)
 
 
 def _debug_log(message: str) -> None:
@@ -65,47 +78,30 @@ def _device_log(device_id: str, message: str) -> None:
 
 
 def run_adb_command(cmd: List[str], timeout: int = 10, device_id: str = "") -> Dict[str, Any]:
-    """Run an adb command safely with timeout and structured response."""
+    """Run an adb command with retry policy and structured response."""
     command_text = " ".join(cmd)
     if device_id:
-        print(f"Running on device: {device_id}")
-        _device_log(device_id, f"Running on device: {device_id}")
         _device_log(device_id, f"$ {command_text}")
     _debug_log(f"$ {command_text}")
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        output = (error.stdout or "").strip()
-        err = f"timeout after {timeout}s"
-        _debug_log(f"ERROR: {err}")
-        return {"success": False, "output": output, "error": err}
-    except subprocess.CalledProcessError as error:
-        output = (error.stdout or "").strip()
-        err = (error.stderr or str(error)).strip()
-        _debug_log(f"ERROR: {err}")
-        return {"success": False, "output": output, "error": err}
 
-    output = (result.stdout or "").strip()
-    err = (result.stderr or "").strip()
-    _debug_log(f"stdout:\n{output}")
-    if err:
-        _debug_log(f"stderr:\n{err}")
+    response = adb_client.run_adb_command(
+        cmd,
+        timeout=timeout,
+        retries=ADB_RETRY_COUNT,
+    )
+
+    if response.output:
+        _debug_log(f"stdout:\n{response.output}")
+    if response.error:
+        _debug_log(f"stderr:\n{response.error}")
+
     if device_id:
-        if output:
-            _device_log(device_id, f"stdout: {output}")
-        if err:
-            _device_log(device_id, f"stderr: {err}")
+        if response.output:
+            _device_log(device_id, f"stdout: {response.output}")
+        if response.error:
+            _device_log(device_id, f"stderr: {response.error}")
 
-    success = result.returncode == 0
-    if not success and not err:
-        err = f"exit code {result.returncode}"
-    return {"success": success, "output": output, "error": err}
+    return response.to_dict()
 
 
 def _adb_shell_getprop(target: str, prop_name: str) -> str:
@@ -128,20 +124,44 @@ def _adb_shell_memtotal_mb(target: str) -> MetricValue:
     return total_mb
 
 
+def _collect_getprops(target: str) -> Dict[str, str]:
+    response = run_adb_command(["adb", "-s", target, "shell", "getprop"], timeout=15, device_id=target)
+    if not response["success"]:
+        return {}
+
+    props: Dict[str, str] = {}
+    for line in str(response.get("output", "")).splitlines():
+        match = re.match(r"^\[(.+?)\]:\s*\[(.*?)\]\s*$", line.strip())
+        if match:
+            props[match.group(1)] = match.group(2)
+    return props
+
+
 def collect_device_details(target: str) -> Dict[str, MetricValue]:
-    cpu_abi = _adb_shell_getprop(target, "ro.product.cpu.abi")
-    abi_list = _adb_shell_getprop(target, "ro.product.cpu.abilist")
+    props = _collect_getprops(target)
+
+    def _prop(name: str, fallback: str = "N/A") -> str:
+        value = props.get(name)
+        if value is None:
+            return fallback
+        value = value.strip()
+        return value or fallback
+
+    cpu_abi = _prop("ro.product.cpu.abi")
+    abi_list = _prop("ro.product.cpu.abilist")
     cpu_details = abi_list if abi_list != "N/A" else cpu_abi
 
     details: Dict[str, MetricValue] = {
-        "model": _adb_shell_getprop(target, "ro.product.model"),
-        "manufacturer": _adb_shell_getprop(target, "ro.product.manufacturer"),
-        "brand": _adb_shell_getprop(target, "ro.product.brand"),
-        "device": _adb_shell_getprop(target, "ro.product.device"),
-        "android_version": _adb_shell_getprop(target, "ro.build.version.release"),
-        "sdk_int": _adb_shell_getprop(target, "ro.build.version.sdk"),
-        "build_fingerprint": _adb_shell_getprop(target, "ro.build.fingerprint"),
+        "model": _prop("ro.product.model"),
+        "manufacturer": _prop("ro.product.manufacturer"),
+        "brand": _prop("ro.product.brand"),
+        "device": _prop("ro.product.device"),
+        "android_version": _prop("ro.build.version.release"),
+        "sdk_int": _prop("ro.build.version.sdk"),
+        "build_fingerprint": _prop("ro.build.fingerprint"),
+        "kernel_version": _prop("ro.kernel.version"),
         "cpu": cpu_details,
+        "abi_list": abi_list,
         "total_memory_mb": _adb_shell_memtotal_mb(target),
     }
     return details
@@ -168,12 +188,10 @@ def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
             continue
         match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
         if not match:
-            # Some Android builds return CPU as a bare number in top output.
-            match = re.search(r"\b(\d+(?:\.\d+)?)\b", line)
-        if match:
-            value = float(match.group(1))
-            _debug_log(f"Parsed CPU from line: {line} => {value}")
-            return value
+            continue
+        value = float(match.group(1))
+        _debug_log(f"Parsed CPU from line: {line} => {value}")
+        return value
     return "N/A"
 
 
@@ -182,12 +200,8 @@ def parse_cpu_usage_cpuinfo(cpuinfo_output: str, package_name: str) -> MetricVal
     for line in cpuinfo_output.splitlines():
         if package_name not in line:
             continue
-        # dumpsys cpuinfo frequently renders lines like:
-        # "6.1% 1234/com.example.app: 4.2% user + 1.9% kernel"
-        # so parse the leading process value first.
         match = re.search(rf"^\s*([0-9]+(?:\.[0-9]+)?)%\s+\d+/{escaped_pkg}(?::\S+)?\b", line)
         if not match:
-            # Fallback: parse the first percentage on package-containing lines.
             match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", line)
         if match:
             value = float(match.group(1))
@@ -248,10 +262,10 @@ def _get_package_pids(target: str, package_name: str) -> List[str]:
     return [pid for pid in result["output"].split() if pid.isdigit()]
 
 
-def collect_gc_count(target: str, package_name: str) -> int:
+def collect_gc_count(target: str, package_name: str, max_lines: int = 4000) -> int:
     pids = set(_get_package_pids(target, package_name))
     logcat = run_adb_command(
-        ["adb", "-s", target, "logcat", "-d", "-v", "threadtime"],
+        ["adb", "-s", target, "logcat", "-d", "-t", str(max_lines), "-v", "threadtime"],
         timeout=20,
         device_id=target,
     )
@@ -277,7 +291,6 @@ def collect_gc_count(target: str, package_name: str) -> int:
             total += 1
             continue
 
-        # Fallbacks for devices where PID matching is unreliable across app restarts.
         if package_name in line or package_process_prefix in line:
             total += 1
             continue
@@ -389,10 +402,10 @@ def collect_performance_metrics(
     fps = parse_fps(gfx["output"]) if gfx["success"] else "N/A"
 
     return {
-        "cpu_percent": cpu,
-        "memory_mb": memory,
-        "launch_time": launch_times,
+        "cpu": cpu,
+        "memory": memory,
         "fps": fps,
+        "launch_time": launch_times,
         "raw": {
             "top": top,
             "cpuinfo": cpuinfo,
@@ -407,10 +420,8 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     component = f"{package_name}/{activity_name}"
     device_details = collect_device_details(target)
 
-    # Keep only benchmark-time logs so GC count is scoped to this run.
     run_adb_command(["adb", "-s", target, "logcat", "-c"], timeout=10, device_id=target)
 
-    # Launch app once and keep it running while runtime metrics are observed.
     _start_app(target, component, timeout=20)
     avg_cpu = collect_cpu_average(
         target,
@@ -431,7 +442,7 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
         "device_details": device_details,
         "runtime_metrics": {
             "cpu": avg_cpu,
-            "memory": runtime.get("memory_mb", "N/A"),
+            "memory": runtime.get("memory", "N/A"),
             "fps": runtime.get("fps", "N/A"),
             "gc_count": gc_count,
         },
@@ -448,14 +459,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package", required=True)
     parser.add_argument("--activity", required=True)
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--runtime-window", type=int, default=60, help="CPU sampling window seconds")
+    parser.add_argument("--sample-interval", type=int, default=5, help="CPU sampling interval seconds")
+    parser.add_argument("--adb-retries", type=int, default=1, help="Retries for adb commands")
     parser.add_argument("--debug", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.iterations <= 0:
+        raise ValueError("--iterations must be > 0")
+
     logging_config.setup_logging(args.debug)
     set_debug(args.debug)
+    set_runtime_collection(args.runtime_window, args.sample_interval)
+    set_adb_retries(args.adb_retries)
 
     results: Dict[str, Any] = {}
     for device in get_devices():

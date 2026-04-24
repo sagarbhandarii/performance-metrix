@@ -6,13 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+import adb_client
 import device_registry
 import logging_config
 
@@ -62,7 +62,7 @@ def run_adb_command(
     timeout_seconds: int,
     logger: logging.Logger,
     device_id: str,
-) -> subprocess.CompletedProcess[str]:
+) -> None:
     """Run adb command and raise descriptive errors for common failure modes."""
     log_path = LOGS_DIR / f"{device_id.replace(':', '_')}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,29 +71,18 @@ def run_adb_command(
     with log_path.open("a", encoding="utf-8") as file:
         file.write(f"Running on device: {device_id}\n")
         file.write(f"$ {' '.join(command)}\n")
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError(f"timeout after {timeout_seconds}s") from error
 
-    stderr = (result.stderr or "").strip()
-    stdout = (result.stdout or "").strip()
+    result = adb_client.run_adb_command(command, timeout=timeout_seconds, retries=1)
+    stderr = (result.error or "").strip()
+    stdout = (result.output or "").strip()
     merged = f"{stdout}\n{stderr}".lower()
 
     if "device offline" in merged or "device not found" in merged:
         raise RuntimeError("device disconnected")
 
-    if result.returncode != 0:
+    if not result.success:
         failure_text = stderr or stdout or f"exit code {result.returncode}"
         raise RuntimeError(failure_text)
-
-    return result
 
 
 def install_and_launch(
