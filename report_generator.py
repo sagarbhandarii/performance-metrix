@@ -107,6 +107,9 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
                 "memory": _metric_value(runtime, "memory", "memory_mb", "avg_memory", "memory_usage"),
                 "fps": _metric_value(runtime, "fps", "avg_fps", "frame_rate"),
                 "gc_count": _metric_value(runtime, "gc_count"),
+                "cpu_status": str(runtime.get("status", {}).get("cpu", "missing")) if isinstance(runtime.get("status"), dict) else "missing",
+                "memory_status": str(runtime.get("status", {}).get("memory", "missing")) if isinstance(runtime.get("status"), dict) else "missing",
+                "fps_status": str(runtime.get("status", {}).get("fps", "missing")) if isinstance(runtime.get("status"), dict) else "missing",
                 "error": error,
             }
         )
@@ -222,13 +225,22 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
         return "metric-bad"
 
     rows_html: List[str] = []
+    def _display_metric(value: float | None, status: str) -> str:
+        if isinstance(value, float):
+            return _fmt_num(value)
+        if status == "loading":
+            return "Loading..."
+        if status == "retrying":
+            return "Retrying..."
+        return "N/A"
+
     for row in rows:
         rows_html.append(
             "<tr>"
             f"<td>{escape(row['device'])}</td>"
-            f"<td class=\"{_perf_class_cpu(row['cpu'])}\">{_fmt_num(row['cpu'])}</td>"
-            f"<td>{_fmt_num(row['memory'])}</td>"
-            f"<td class=\"{_perf_class_fps(row['fps'])}\">{_fmt_num(row['fps'])}</td>"
+            f"<td class=\"{_perf_class_cpu(row['cpu'])}\">{_display_metric(row['cpu'], row.get('cpu_status', 'missing'))}</td>"
+            f"<td>{_display_metric(row['memory'], row.get('memory_status', 'missing'))}</td>"
+            f"<td class=\"{_perf_class_fps(row['fps'])}\">{_display_metric(row['fps'], row.get('fps_status', 'missing'))}</td>"
             f"<td>{_fmt_num(row['gc_count'], 0)}</td>"
             f"<td class=\"{'metric-bad' if row['error'] else 'metric-good'}\">{escape(row['error']) if row['error'] else 'None'}</td>"
             "</tr>"
