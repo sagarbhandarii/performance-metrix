@@ -67,6 +67,22 @@ class ReportGeneratorPayloadTests(unittest.TestCase):
         self.assertEqual(payload["startup_metrics"]["warm"]["values"], [900.0, None])
         self.assertEqual(payload["startup_metrics"]["hot"]["values"], [None, None])
 
+    def test_collect_rows_supports_legacy_warm_start_keys(self) -> None:
+        devices = {
+            "device-1": {
+                "startup_metrics": {
+                    "cold_start": {"average": "1200", "samples": ["1100", "1300"]},
+                    "warm_start": {"average": "850", "samples": ["800", "900"]},
+                    "hot_start": {"average": "700", "samples": ["690"]},
+                }
+            }
+        }
+        _, startup_rows, _ = report_generator._collect_rows(devices)
+        self.assertEqual(startup_rows[0]["cold_avg"], 1200.0)
+        self.assertEqual(startup_rows[0]["warm_avg"], 850.0)
+        self.assertEqual(startup_rows[0]["hot_avg"], 700.0)
+        self.assertEqual(startup_rows[0]["warm_values"], [800.0, 900.0])
+
 
 if __name__ == "__main__":
     unittest.main()
