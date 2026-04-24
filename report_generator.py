@@ -173,6 +173,32 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
     }
 
 
+
+
+def _build_insights(runtime_rows: List[Dict[str, Any]], startup_rows: List[Dict[str, Any]]) -> List[str]:
+    insights: List[str] = []
+
+    failed = [row for row in runtime_rows if row.get("error")]
+    if failed:
+        insights.append(f"{len(failed)} device(s) reported runtime/startup errors.")
+
+    low_fps = [row for row in runtime_rows if isinstance(row.get("fps"), float) and row["fps"] < 30.0]
+    if low_fps:
+        names = ", ".join(row["device"] for row in low_fps[:4])
+        insights.append(f"Low FPS detected (<30) on: {names}.")
+
+    high_gc = [row for row in runtime_rows if isinstance(row.get("gc_count"), float) and row["gc_count"] >= 30]
+    if high_gc:
+        names = ", ".join(row["device"] for row in high_gc[:4])
+        insights.append(f"High GC activity detected on: {names}.")
+
+    for row in startup_rows:
+        cold, warm = row.get("cold_avg"), row.get("warm_avg")
+        if isinstance(cold, float) and isinstance(warm, float) and warm > 0 and cold > warm * 1.3:
+            insights.append(f"{row['device']} has cold start >30% slower than warm start.")
+
+    return insights if insights else ["No major anomalies detected from available metrics."]
+
 def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return "<tr><td colspan=\"6\">No runtime data available</td></tr>"
@@ -261,9 +287,9 @@ def _device_rows_html(rows: List[Dict[str, Any]]) -> str:
 
 
 def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    cold_avg = _avg([row["cold_avg"] for row in startup_rows if isinstance(row["cold_avg"], float)]) or 0.0
-    warm_avg = _avg([row["warm_avg"] for row in startup_rows if isinstance(row["warm_avg"], float)]) or 0.0
-    hot_avg = _avg([row["hot_avg"] for row in startup_rows if isinstance(row["hot_avg"], float)]) or 0.0
+    cold_avg = _avg([row["cold_avg"] for row in startup_rows if isinstance(row["cold_avg"], float)])
+    warm_avg = _avg([row["warm_avg"] for row in startup_rows if isinstance(row["warm_avg"], float)])
+    hot_avg = _avg([row["hot_avg"] for row in startup_rows if isinstance(row["hot_avg"], float)])
 
     cold_values: List[float] = []
     warm_values: List[float] = []
@@ -273,11 +299,13 @@ def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         warm_values.extend(row["warm_values"])
         hot_values.extend(row["hot_values"])
 
-    def _pad(values: List[float], target: int = 10) -> List[float]:
-        trimmed = values[:target]
-        if len(trimmed) < target:
-            trimmed.extend([0.0] * (target - len(trimmed)))
-        return trimmed
+    max_points = max(len(cold_values), len(warm_values), len(hot_values), 0)
+
+    def _pad_nullable(values: List[float], target: int) -> List[float | None]:
+        out: List[float | None] = [round(v, 2) for v in values[:target]]
+        while len(out) < target:
+            out.append(None)
+        return out
 
     device_labels = [row["device"] for row in startup_rows]
     device_avg_values = [
@@ -290,15 +318,16 @@ def _chart_payload(startup_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "startup_metrics": {
-            "cold": {"avg": round(cold_avg, 2), "values": _pad(cold_values)},
-            "warm": {"avg": round(warm_avg, 2), "values": _pad(warm_values)},
-            "hot": {"avg": round(hot_avg, 2), "values": _pad(hot_values)},
+            "cold": {"avg": round(cold_avg, 2) if cold_avg is not None else None, "values": _pad_nullable(cold_values, max_points)},
+            "warm": {"avg": round(warm_avg, 2) if warm_avg is not None else None, "values": _pad_nullable(warm_values, max_points)},
+            "hot": {"avg": round(hot_avg, 2) if hot_avg is not None else None, "values": _pad_nullable(hot_values, max_points)},
+            "labels": list(range(1, max_points + 1)),
         },
         "device_metrics": {"labels": device_labels, "startup_avg_ms": device_avg_values},
     }
 
 
-def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, device_rows: str, chart_data_json: str) -> str:
+def _html_report(summary: Dict[str, str], insights_html: str, runtime_rows: str, startup_rows: str, device_rows: str, chart_data_json: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -499,7 +528,14 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       <span class=\"label\">Avg Time</span>
       <span class=\"value\">{summary['overall']}</span>
     </div>
-  </div>
+</div>
+</div>
+
+<div class=\"card\">
+  <h2>Insights</h2>
+  <ul>
+    {insights_html}
+  </ul>
 </div>
 
 <div class=\"card\">
@@ -560,7 +596,7 @@ def _html_report(summary: Dict[str, str], runtime_rows: str, startup_rows: str, 
       </div>
     </div>
     <div class=\"chart-panel\" id=\"linePanel\">
-      <h3>Launch Time Trend (Top 10 Samples)</h3>
+      <h3>Launch Time Trend</h3>
       <div class=\"chart-container\">
         <canvas id=\"lineChart\"></canvas>
         <div class=\"chart-message\" id=\"lineChartMessage\">No data available.</div>
@@ -602,11 +638,11 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
 
   function toNumberArray(values) {{
     if (!Array.isArray(values)) return [];
-    return values.filter((value) => typeof value === 'number' && Number.isFinite(value));
+    return values.map((value) => (typeof value === 'number' && Number.isFinite(value) ? value : null));
   }}
 
   function hasPositiveValue(values) {{
-    return values.some((value) => value > 0);
+    return values.some((value) => typeof value === 'number' && value > 0);
   }}
 
   if (!ctx || !ctx2 || !ctx3) {{
@@ -629,13 +665,13 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
   const coldAvg = Number(startupMetrics?.cold?.avg);
   const warmAvg = Number(startupMetrics?.warm?.avg);
   const hotAvg = Number(startupMetrics?.hot?.avg);
-  const barValues = [coldAvg, warmAvg, hotAvg].map((value) => (Number.isFinite(value) ? value : 0));
+  const barValues = [coldAvg, warmAvg, hotAvg].map((value) => (Number.isFinite(value) ? value : null));
   const coldTrend = toNumberArray(startupMetrics?.cold?.values);
   const warmTrend = toNumberArray(startupMetrics?.warm?.values);
   const hotTrend = toNumberArray(startupMetrics?.hot?.values);
 
   const labels = Array.isArray(data.device_metrics?.labels) ? data.device_metrics.labels : [];
-  const values = toNumberArray(data.device_metrics?.startup_avg_ms);
+  const values = toNumberArray(data.device_metrics?.startup_avg_ms).filter((value) => typeof value === 'number');
 
   try {{
     if (hasPositiveValue(barValues)) {{
@@ -672,7 +708,7 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
       new Chart(ctx2, {{
         type: 'line',
         data: {{
-          labels: [1,2,3,4,5,6,7,8,9,10],
+          labels: Array.isArray(startupMetrics?.labels) ? startupMetrics.labels : [],
           datasets: [
             {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', fill: false }},
             {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', fill: false }},
@@ -742,12 +778,14 @@ def generate_report_from_results(results: Dict[str, Any], output_file: Path = OU
     runtime_data, startup_data, device_data = _collect_rows(devices)
 
     summary = _build_summary(startup_data)
+    insights = _build_insights(runtime_data, startup_data)
+    insights_html = "\n".join(f"<li>{escape(item)}</li>" for item in insights)
     runtime_rows = _runtime_rows_html(runtime_data)
     startup_rows = _startup_rows_html(startup_data)
     device_rows = _device_rows_html(device_data)
     chart_data_json = json.dumps(_chart_payload(startup_data))
 
-    html = _html_report(summary, runtime_rows, startup_rows, device_rows, chart_data_json)
+    html = _html_report(summary, insights_html, runtime_rows, startup_rows, device_rows, chart_data_json)
     output_file.write_text(html, encoding="utf-8")
     LOGGER.info("Report generated: %s", output_file)
     return output_file

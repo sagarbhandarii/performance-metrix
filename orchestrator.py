@@ -20,6 +20,32 @@ import report_generator
 LOGGER = logging_config.get_logger("orchestrator")
 
 
+def _failed_result(error: str) -> Dict[str, Any]:
+    return {
+        "device_details": {
+            "model": "N/A",
+            "manufacturer": "N/A",
+            "brand": "N/A",
+            "device": "N/A",
+            "android_version": "N/A",
+            "sdk_int": "N/A",
+            "build_fingerprint": "N/A",
+            "kernel_version": "N/A",
+            "cpu": "N/A",
+            "abi_list": "N/A",
+            "total_memory_mb": "N/A",
+        },
+        "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A", "gc_count": "N/A"},
+        "startup_metrics": {
+            "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+            "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+            "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
+        },
+        "runtime_details": {"launch_time": {}, "raw": {}},
+        "error": error,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Android performance benchmark pipeline.")
     parser.add_argument("--apk", required=True, help="Path to APK file")
@@ -28,15 +54,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=10, help="Iterations per start type")
     parser.add_argument("--max-threads", type=int, default=4, help="Parallel install workers")
     parser.add_argument("--timeout", type=int, default=90, help="Install/launch adb timeout")
+    parser.add_argument("--runtime-window", type=int, default=60, help="CPU sampling window seconds")
+    parser.add_argument("--sample-interval", type=int, default=5, help="CPU sampling interval seconds")
+    parser.add_argument("--adb-retries", type=int, default=1, help="Retries for adb commands")
+    parser.add_argument("--quick", action="store_true", help="Use quicker benchmark defaults")
     parser.add_argument("--output-dir", default="performance_runs", help="Base output directory for run artifacts")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.iterations <= 0:
+        raise ValueError("--iterations must be greater than 0")
+    if args.max_threads <= 0:
+        raise ValueError("--max-threads must be greater than 0")
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be greater than 0")
+
+    apk_path = Path(args.apk)
+    if not apk_path.exists() or not apk_path.is_file():
+        raise FileNotFoundError(f"APK does not exist or is not a file: {apk_path}")
+
+    if args.quick:
+        args.runtime_window = min(args.runtime_window, 20)
+        args.sample_interval = min(args.sample_interval, 2)
+        args.iterations = min(args.iterations, 3)
+
+    return args
 
 
 def _detect_valid_adb_devices() -> List[str]:
     active_devices = sorted(device_registry.get_active_devices())
-    print(f"Detected active devices ({len(active_devices)}): {active_devices}")
-    LOGGER.info("Detected active devices: %s", active_devices)
+    LOGGER.info("Detected active devices (%d): %s", len(active_devices), active_devices)
     return active_devices
 
 
@@ -97,36 +144,16 @@ def stage_run_benchmarks(
     LOGGER.info("Step 3/6: Run runtime + startup benchmarks")
     results: Dict[str, Any] = {}
 
-    def _failed_result(status: install_apk_parallel.DeviceExecutionStatus) -> Dict[str, Any]:
-        return {
-            "device_details": {
-                "model": "N/A",
-                "manufacturer": "N/A",
-                "brand": "N/A",
-                "device": "N/A",
-                "android_version": "N/A",
-                "sdk_int": "N/A",
-                "build_fingerprint": "N/A",
-                "cpu": "N/A",
-                "total_memory_mb": "N/A",
-            },
-            "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
-            "startup_metrics": {
-                "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-            },
-            "runtime_details": {"launch_time": {}, "raw": {}},
-            "error": status.error or "install/launch failed",
-        }
-
     successful: List[install_apk_parallel.DeviceExecutionStatus] = []
     for status in statuses:
         device_id = status.device_id
         if status.status != "success":
-            results[device_id] = _failed_result(status)
+            results[device_id] = _failed_result(status.error or "install/launch failed")
             continue
         successful.append(status)
+
+    if not successful:
+        return results
 
     workers = max(1, min(max_threads, len(successful)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -145,27 +172,7 @@ def stage_run_benchmarks(
             try:
                 results[device_id] = future.result()
             except Exception as error:
-                results[device_id] = {
-                    "device_details": {
-                        "model": "N/A",
-                        "manufacturer": "N/A",
-                        "brand": "N/A",
-                        "device": "N/A",
-                        "android_version": "N/A",
-                        "sdk_int": "N/A",
-                        "build_fingerprint": "N/A",
-                        "cpu": "N/A",
-                        "total_memory_mb": "N/A",
-                    },
-                    "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
-                    "startup_metrics": {
-                        "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                        "warm": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                        "hot": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
-                    },
-                    "runtime_details": {"launch_time": {}, "raw": {}},
-                    "error": str(error),
-                }
+                results[device_id] = _failed_result(str(error))
 
     return results
 
@@ -206,6 +213,8 @@ def main() -> None:
 
     logging_config.setup_logging(args.debug)
     performance_collector.set_debug(args.debug)
+    performance_collector.set_runtime_collection(args.runtime_window, args.sample_interval)
+    performance_collector.set_adb_retries(args.adb_retries)
 
     active_devices = stage_connect_devices()
     if len(active_devices) > 1:
