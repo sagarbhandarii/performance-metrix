@@ -223,13 +223,15 @@ def stage_run_benchmarks(
             except Exception as error:
                 results[device_id] = _failed_result(str(error))
 
-    return results
+    return dict(sorted(results.items(), key=lambda item: item[0]))
 
 
 def stage_collect_and_save(results: Dict[str, Any]) -> Path:
     LOGGER.info("Step 4/6: Aggregate and save results")
-    performance_collector.FINAL_RESULTS_FILE.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    performance_collector.OUTPUT_FILE.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    stable_results = dict(sorted(results.items(), key=lambda item: item[0]))
+    serialized = json.dumps(stable_results, indent=2, sort_keys=True)
+    performance_collector.FINAL_RESULTS_FILE.write_text(serialized, encoding="utf-8")
+    performance_collector.OUTPUT_FILE.write_text(serialized, encoding="utf-8")
     return performance_collector.FINAL_RESULTS_FILE.resolve()
 
 
@@ -264,6 +266,7 @@ def main() -> None:
     performance_collector.set_debug(args.debug)
     performance_collector.set_runtime_collection(args.runtime_window, args.sample_interval)
     performance_collector.set_adb_retries(args.adb_retries)
+    performance_collector.reset_runtime_cache()
 
     active_devices = stage_connect_devices()
     if len(active_devices) > 1:

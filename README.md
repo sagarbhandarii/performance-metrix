@@ -240,6 +240,24 @@ Open HTML report:
 
 ---
 
+## 6.1) Result stability assumptions and validation
+
+To improve repeatability, the collector now enforces and documents these assumptions:
+
+- Device is thermally stable and not running unrelated heavy workloads during test windows.
+- The tested app stays in foreground while runtime sampling is happening.
+- ADB connection remains healthy during each collection step (bounded retries are applied).
+
+Additional safeguards now applied:
+
+- Runtime cache is reset at each orchestrated run to avoid stale cross-run fallback values.
+- CPU sampling uses a fixed sample count derived from `runtime-window` and `sample-interval`.
+- GC counting is filtered to package/pid-matching entries only.
+- Final JSON output is saved with stable device ordering and sorted keys.
+- Sanity validation normalizes out-of-range values (CPU/FPS/memory/GC/startup timings) before writing results.
+
+---
+
 ## 7) Troubleshooting
 
 ## A) `adb` not recognized
