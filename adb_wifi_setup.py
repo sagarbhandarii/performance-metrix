@@ -39,12 +39,16 @@ def get_connected_devices() -> List[str]:
 
         device_id, state = parts[0], parts[1]
         # Only include physical USB devices. This skips mDNS/TLS entries like:
-        # adb-<serial>-<token>._adb-tls-connect._tcp
-        # and network targets like <ip>:5555.
-        is_usb_transport = " usb:" in f" {line} "
+        # adb-<serial>-<token>._adb-tls-connect._tcp and network targets like <ip>:5555.
+        # Some adb versions do not print a `usb:` marker in `adb devices -l` output,
+        # so we also treat plain serials with a transport id as USB candidates.
+        has_usb_marker = " usb:" in f" {line} "
+        has_transport_id = "transport_id:" in line
         is_wireless_serial = ".adb-tls-connect._tcp" in device_id or ":" in device_id
+        is_emulator = device_id.startswith("emulator-")
+        is_usb_transport = (has_usb_marker or has_transport_id) and not is_wireless_serial and not is_emulator
 
-        if state == "device" and is_usb_transport and not is_wireless_serial:
+        if state == "device" and is_usb_transport:
             devices.append(device_id)
         elif state == "device":
             print(f"[{device_id}] Skipping: not a USB transport")
