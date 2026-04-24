@@ -558,8 +558,10 @@ def collect_performance_metrics(
 
 def run_full_benchmark(target: str, package_name: str, activity_name: str, iterations: int = 10) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
+    LOGGER.info("[%s] Benchmark step 1/4: Collect device details", target)
     device_details = collect_device_details(target)
 
+    LOGGER.info("[%s] Benchmark step 2/4: Validate device state and collect runtime metrics", target)
     state = run_adb_command(["adb", "-s", target, "get-state"], timeout=10, device_id=target)
     if not state["success"] or "device" not in state.get("output", ""):
         _debug_log(f"[{target}] Device not in ready state before benchmark: {state}")
@@ -577,12 +579,14 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     runtime_cpu = _runtime_metric_or_cached(runtime.get("cpu", "N/A"), avg_cpu, "cpu", target)
     gc_count = collect_gc_count(target, package_name)
 
+    LOGGER.info("[%s] Benchmark step 3/4: Run startup benchmarks (cold/warm/hot)", target)
     startup = {
         "cold": run_start_test(target, "cold", component, package_name, iterations),
         "warm": run_start_test(target, "warm", component, package_name, iterations),
         "hot": run_start_test(target, "hot", component, package_name, iterations),
     }
 
+    LOGGER.info("[%s] Benchmark step 4/4: Build benchmark result payload", target)
     return {
         "device_details": device_details,
         "runtime_metrics": {

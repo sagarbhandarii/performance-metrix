@@ -48,7 +48,7 @@ def run_adb_command(
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=timeout,
                 check=False,
             )
@@ -61,8 +61,8 @@ def run_adb_command(
             last_error = str(error)
             last_return_code = -1
         else:
-            stdout = (result.stdout or "").strip()
-            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+            stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
             merged = f"{stdout}\n{stderr}".lower()
 
             last_output = stdout
