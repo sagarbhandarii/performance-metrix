@@ -186,12 +186,21 @@ def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
     for line in top_output.splitlines():
         if package_name not in line:
             continue
-        match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
-        if not match:
-            continue
-        value = float(match.group(1))
-        _debug_log(f"Parsed CPU from line: {line} => {value}")
-        return value
+        percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        if percent_match:
+            value = float(percent_match.group(1))
+            _debug_log(f"Parsed CPU from line (% style): {line} => {value}")
+            return value
+
+        # Newer Android top outputs may expose %CPU as a numeric column (without %).
+        cpu_column_match = re.search(
+            r"\b[SRDTZX]\s+([0-9]+(?:\.[0-9]+)?)\s+[0-9]+(?:\.[0-9]+)?\s+\S+\s+.+$",
+            line,
+        )
+        if cpu_column_match:
+            value = float(cpu_column_match.group(1))
+            _debug_log(f"Parsed CPU from line (column style): {line} => {value}")
+            return value
     return "N/A"
 
 
@@ -211,12 +220,13 @@ def parse_cpu_usage_cpuinfo(cpuinfo_output: str, package_name: str) -> MetricVal
 
 
 def parse_memory_mb(meminfo_output: str) -> MetricValue:
+    normalized = meminfo_output.replace(",", "")
     patterns = [
         r"TOTAL\s+PSS:\s*([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?",
         r"\bTOTAL\b\s+([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)?",
     ]
     for pattern in patterns:
-        match = re.search(pattern, meminfo_output, flags=re.IGNORECASE)
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
         if not match:
             continue
         value = float(match.group(1))
@@ -249,10 +259,53 @@ def parse_fps(gfxinfo_output: str) -> MetricValue:
         _debug_log(f"Parsed FPS from janky frames: {fps}")
         return fps
 
+    percentile_match = re.search(r"50th percentile:\s*([0-9]+(?:\.[0-9]+)?)ms", gfxinfo_output, flags=re.IGNORECASE)
+    if percentile_match:
+        frame_time_ms = float(percentile_match.group(1))
+        if frame_time_ms > 0:
+            fps = round(min(240.0, 1000.0 / frame_time_ms), 2)
+            _debug_log(f"Parsed FPS from 50th percentile frame time: {fps}")
+            return fps
+
     total = re.search(r"Total frames rendered:\s*(\d+)", gfxinfo_output, flags=re.IGNORECASE)
     if total and int(total.group(1)) > 0:
         _debug_log("Frame stats found but no janky %; FPS unavailable")
     return "N/A"
+
+
+def _runtime_metric_or_cached(value: MetricValue, cached: MetricValue, metric_name: str, target: str) -> MetricValue:
+    if isinstance(value, float):
+        return value
+    if isinstance(cached, float):
+        _debug_log(f"[{target}] Using cached {metric_name}: {cached}")
+        return cached
+    return "N/A"
+
+
+def _collect_runtime_metrics_with_retries(
+    target: str,
+    package_name: str,
+    activity_name: str,
+    attempts: int = 3,
+) -> Dict[str, Any]:
+    runtime_last: Dict[str, Any] = {}
+    cached_metrics: Dict[str, MetricValue] = {"cpu": "N/A", "memory": "N/A", "fps": "N/A"}
+
+    for attempt in range(1, max(1, attempts) + 1):
+        runtime_last = collect_performance_metrics(target, package_name, activity_name, launch_before_collect=False)
+        for metric in ("cpu", "memory", "fps"):
+            value = runtime_last.get(metric, "N/A")
+            if isinstance(value, float):
+                cached_metrics[metric] = value
+        if all(isinstance(cached_metrics[m], float) for m in ("cpu", "memory", "fps")):
+            break
+        _debug_log(f"[{target}] Runtime metric attempt {attempt}/{attempts} incomplete; retrying.")
+        time.sleep(1)
+
+    runtime_last["cpu"] = _runtime_metric_or_cached(runtime_last.get("cpu", "N/A"), cached_metrics["cpu"], "cpu", target)
+    runtime_last["memory"] = _runtime_metric_or_cached(runtime_last.get("memory", "N/A"), cached_metrics["memory"], "memory", target)
+    runtime_last["fps"] = _runtime_metric_or_cached(runtime_last.get("fps", "N/A"), cached_metrics["fps"], "fps", target)
+    return runtime_last
 
 
 def _get_package_pids(target: str, package_name: str) -> List[str]:
@@ -401,6 +454,13 @@ def collect_performance_metrics(
     launch_times = parse_launch_times(launch["output"]) if launch["success"] else {"ThisTime": "N/A", "TotalTime": "N/A", "WaitTime": "N/A"}
     fps = parse_fps(gfx["output"]) if gfx["success"] else "N/A"
 
+    if cpu == "N/A":
+        _debug_log(f"[{target}] CPU parse unavailable (top success={top['success']}, cpuinfo success={cpuinfo['success']})")
+    if memory == "N/A":
+        _debug_log(f"[{target}] Memory parse unavailable (meminfo success={mem['success']})")
+    if fps == "N/A":
+        _debug_log(f"[{target}] FPS parse unavailable (gfxinfo success={gfx['success']})")
+
     return {
         "cpu": cpu,
         "memory": memory,
@@ -420,6 +480,10 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     component = f"{package_name}/{activity_name}"
     device_details = collect_device_details(target)
 
+    state = run_adb_command(["adb", "-s", target, "get-state"], timeout=10, device_id=target)
+    if not state["success"] or "device" not in state.get("output", ""):
+        _debug_log(f"[{target}] Device not in ready state before benchmark: {state}")
+
     run_adb_command(["adb", "-s", target, "logcat", "-c"], timeout=10, device_id=target)
 
     _start_app(target, component, timeout=20)
@@ -429,7 +493,8 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
         duration_seconds=RUNTIME_OBSERVATION_WINDOW_SECONDS,
         interval_seconds=CPU_SAMPLE_INTERVAL_SECONDS,
     )
-    runtime = collect_performance_metrics(target, package_name, activity_name, launch_before_collect=False)
+    runtime = _collect_runtime_metrics_with_retries(target, package_name, activity_name, attempts=3)
+    runtime_cpu = _runtime_metric_or_cached(runtime.get("cpu", "N/A"), avg_cpu, "cpu", target)
     gc_count = collect_gc_count(target, package_name)
 
     startup = {
@@ -441,7 +506,7 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     return {
         "device_details": device_details,
         "runtime_metrics": {
-            "cpu": avg_cpu,
+            "cpu": runtime_cpu,
             "memory": runtime.get("memory", "N/A"),
             "fps": runtime.get("fps", "N/A"),
             "gc_count": gc_count,

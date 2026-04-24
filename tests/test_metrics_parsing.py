@@ -9,6 +9,10 @@ class PerformanceCollectorParsingTests(unittest.TestCase):
         output = "1234 12% S com.example.app"
         self.assertEqual(performance_collector.parse_cpu_usage(output, "com.example.app"), 12.0)
 
+    def test_parse_cpu_usage_column_style(self) -> None:
+        output = "1234 u0_a123 10 -10 5G 200M 120M S 24.5 3.1 00:03.42 com.example.app"
+        self.assertEqual(performance_collector.parse_cpu_usage(output, "com.example.app"), 24.5)
+
     def test_parse_cpu_usage_cpuinfo_with_suffix(self) -> None:
         output = "  6.1% 1234/com.example.app:service 4.2% user + 1.9% kernel"
         self.assertEqual(performance_collector.parse_cpu_usage_cpuinfo(output, "com.example.app"), 6.1)
@@ -16,6 +20,11 @@ class PerformanceCollectorParsingTests(unittest.TestCase):
     def test_parse_memory_mb_units(self) -> None:
         self.assertEqual(performance_collector.parse_memory_mb("TOTAL PSS: 1024 KB"), 1.0)
         self.assertEqual(performance_collector.parse_memory_mb("TOTAL PSS: 2 GB"), 2048.0)
+        self.assertEqual(performance_collector.parse_memory_mb("TOTAL PSS: 123,904 KB"), 121.0)
+
+    def test_parse_fps_percentile_fallback(self) -> None:
+        output = "Graphics info:\n50th percentile: 16ms\n90th percentile: 24ms"
+        self.assertEqual(performance_collector.parse_fps(output), 62.5)
 
     def test_parse_launch_times_partial(self) -> None:
         result = performance_collector.parse_launch_times("ThisTime: 11\nTotalTime: 22")
