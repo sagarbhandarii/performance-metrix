@@ -79,7 +79,7 @@ def get_active_devices() -> Set[str]:
         result = subprocess.run(
             ["adb", "devices"],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=15,
             check=False,
         )
@@ -87,11 +87,14 @@ def get_active_devices() -> Set[str]:
         LOGGER.error("Failed to execute adb devices: %s", error)
         return set()
 
+    stdout = (result.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+
     if result.returncode != 0:
-        LOGGER.error("adb devices failed: %s", (result.stderr or "").strip())
+        LOGGER.error("adb devices failed: %s", stderr)
         return set()
 
-    devices = _parse_adb_devices_output(result.stdout or "")
+    devices = _parse_adb_devices_output(stdout)
     LOGGER.info("Detected active adb devices: %s", sorted(devices))
     return devices
 

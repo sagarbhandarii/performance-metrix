@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+import adb_client
 import adb_wifi_setup
 import device_registry
 import install_apk_parallel
@@ -83,8 +84,56 @@ def parse_args() -> argparse.Namespace:
 
 def _detect_valid_adb_devices() -> List[str]:
     active_devices = sorted(device_registry.get_active_devices())
+    deduped_devices = _dedupe_physical_devices(active_devices)
     LOGGER.info("Detected active devices (%d): %s", len(active_devices), active_devices)
-    return active_devices
+    if len(deduped_devices) != len(active_devices):
+        LOGGER.info(
+            "De-duplicated active devices to unique physical devices (%d): %s",
+            len(deduped_devices),
+            deduped_devices,
+        )
+    return deduped_devices
+
+
+def _physical_serial_for_target(target: str) -> str:
+    for prop in ("ro.serialno", "ro.boot.serialno"):
+        response = adb_client.run_adb_command(
+            ["adb", "-s", target, "shell", "getprop", prop],
+            timeout=10,
+            retries=0,
+        )
+        serial = (response.output or "").strip()
+        if response.success and serial and serial.lower() not in {"unknown", "n/a"}:
+            return serial
+    return target
+
+
+def _target_priority(target: str) -> int:
+    if target.startswith("adb-"):
+        return 3
+    if ":" in target:
+        return 0
+    return 1
+
+
+def _dedupe_physical_devices(active_devices: List[str]) -> List[str]:
+    by_serial: Dict[str, List[str]] = {}
+    for device in active_devices:
+        serial = _physical_serial_for_target(device)
+        by_serial.setdefault(serial, []).append(device)
+
+    deduped: List[str] = []
+    for serial, aliases in sorted(by_serial.items()):
+        selected = sorted(aliases, key=lambda item: (_target_priority(item), item))[0]
+        if len(aliases) > 1:
+            LOGGER.warning(
+                "Found duplicate adb targets for physical device serial %s: %s. Using %s",
+                serial,
+                sorted(aliases),
+                selected,
+            )
+        deduped.append(selected)
+    return sorted(deduped)
 
 
 def _sync_registry_with_active_devices(active_devices: List[str]) -> None:
