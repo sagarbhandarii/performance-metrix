@@ -108,6 +108,45 @@ def run_adb_command(cmd: List[str], timeout: int = 10, device_id: str = "") -> D
     return {"success": success, "output": output, "error": err}
 
 
+def _adb_shell_getprop(target: str, prop_name: str) -> str:
+    response = run_adb_command(["adb", "-s", target, "shell", "getprop", prop_name], timeout=10, device_id=target)
+    if not response["success"]:
+        return "N/A"
+    value = str(response.get("output", "")).strip()
+    return value or "N/A"
+
+
+def _adb_shell_memtotal_mb(target: str) -> MetricValue:
+    response = run_adb_command(["adb", "-s", target, "shell", "cat", "/proc/meminfo"], timeout=10, device_id=target)
+    if not response["success"]:
+        return "N/A"
+
+    match = re.search(r"MemTotal:\s*(\d+)\s*kB", str(response.get("output", "")), flags=re.IGNORECASE)
+    if not match:
+        return "N/A"
+    total_mb = round(int(match.group(1)) / 1024, 2)
+    return total_mb
+
+
+def collect_device_details(target: str) -> Dict[str, MetricValue]:
+    cpu_abi = _adb_shell_getprop(target, "ro.product.cpu.abi")
+    abi_list = _adb_shell_getprop(target, "ro.product.cpu.abilist")
+    cpu_details = abi_list if abi_list != "N/A" else cpu_abi
+
+    details: Dict[str, MetricValue] = {
+        "model": _adb_shell_getprop(target, "ro.product.model"),
+        "manufacturer": _adb_shell_getprop(target, "ro.product.manufacturer"),
+        "brand": _adb_shell_getprop(target, "ro.product.brand"),
+        "device": _adb_shell_getprop(target, "ro.product.device"),
+        "android_version": _adb_shell_getprop(target, "ro.build.version.release"),
+        "sdk_int": _adb_shell_getprop(target, "ro.build.version.sdk"),
+        "build_fingerprint": _adb_shell_getprop(target, "ro.build.fingerprint"),
+        "cpu": cpu_details,
+        "total_memory_mb": _adb_shell_memtotal_mb(target),
+    }
+    return details
+
+
 def build_target(device: Dict[str, object]) -> str:
     device_id = str(device.get("device_id", "")).strip()
     if ":" in device_id:
@@ -366,6 +405,7 @@ def collect_performance_metrics(
 
 def run_full_benchmark(target: str, package_name: str, activity_name: str, iterations: int = 10) -> Dict[str, Any]:
     component = f"{package_name}/{activity_name}"
+    device_details = collect_device_details(target)
 
     # Keep only benchmark-time logs so GC count is scoped to this run.
     run_adb_command(["adb", "-s", target, "logcat", "-c"], timeout=10, device_id=target)
@@ -388,6 +428,7 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
     }
 
     return {
+        "device_details": device_details,
         "runtime_metrics": {
             "cpu": avg_cpu,
             "memory": runtime.get("memory_mb", "N/A"),

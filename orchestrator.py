@@ -99,6 +99,17 @@ def stage_run_benchmarks(
 
     def _failed_result(status: install_apk_parallel.DeviceExecutionStatus) -> Dict[str, Any]:
         return {
+            "device_details": {
+                "model": "N/A",
+                "manufacturer": "N/A",
+                "brand": "N/A",
+                "device": "N/A",
+                "android_version": "N/A",
+                "sdk_int": "N/A",
+                "build_fingerprint": "N/A",
+                "cpu": "N/A",
+                "total_memory_mb": "N/A",
+            },
             "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
             "startup_metrics": {
                 "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
@@ -135,6 +146,17 @@ def stage_run_benchmarks(
                 results[device_id] = future.result()
             except Exception as error:
                 results[device_id] = {
+                    "device_details": {
+                        "model": "N/A",
+                        "manufacturer": "N/A",
+                        "brand": "N/A",
+                        "device": "N/A",
+                        "android_version": "N/A",
+                        "sdk_int": "N/A",
+                        "build_fingerprint": "N/A",
+                        "cpu": "N/A",
+                        "total_memory_mb": "N/A",
+                    },
                     "runtime_metrics": {"cpu": "N/A", "memory": "N/A", "fps": "N/A"},
                     "startup_metrics": {
                         "cold": {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"},
