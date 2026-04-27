@@ -82,6 +82,24 @@ def _metric_value(source: Dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _device_label(device_id: str, device_details: Dict[str, Any]) -> str:
+    manufacturer = str(device_details.get("manufacturer", "")).strip()
+    model = str(device_details.get("model", "")).strip()
+
+    def _valid(part: str) -> bool:
+        return bool(part) and part.upper() != "N/A"
+
+    manufacturer_valid = _valid(manufacturer)
+    model_valid = _valid(model)
+    if manufacturer_valid and model_valid:
+        return f"{manufacturer} {model}"
+    if model_valid:
+        return model
+    if manufacturer_valid:
+        return manufacturer
+    return device_id
+
+
 def _startup_bucket(startup: Dict[str, Any], mode: str) -> Dict[str, Any]:
     aliases = {
         "cold": ("cold", "cold_start", "coldStart"),
@@ -117,10 +135,12 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
         hot = _startup_bucket(startup, "hot")
         details = device_data.get("device_details", {}) if isinstance(device_data, dict) else {}
         error = str(device_data.get("error", "")).strip() if isinstance(device_data, dict) else ""
+        label = _device_label(device, details)
 
         runtime_rows.append(
             {
                 "device": device,
+                "device_label": label,
                 "cpu": _metric_value(runtime, "cpu", "cpu_percent", "cpu_usage", "avg_cpu"),
                 "memory": _metric_value(runtime, "memory", "memory_mb", "avg_memory", "memory_usage"),
                 "fps": _metric_value(runtime, "fps", "avg_fps", "frame_rate"),
@@ -135,6 +155,7 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
         startup_rows.append(
             {
                 "device": device,
+                "device_label": label,
                 "cold_avg": _metric_value(cold, "avg", "average"),
                 "warm_avg": _metric_value(warm, "avg", "average"),
                 "hot_avg": _metric_value(hot, "avg", "average"),
@@ -147,6 +168,7 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
         device_rows.append(
             {
                 "device": device,
+                "device_label": label,
                 "model": str(details.get("model", "N/A")),
                 "manufacturer": str(details.get("manufacturer", "N/A")),
                 "android_version": str(details.get("android_version", "N/A")),
@@ -172,7 +194,7 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
     for row in startup_rows:
         cold = row.get("cold_avg")
         if isinstance(cold, float):
-            averages.append((row["device"], cold))
+            averages.append((row["device_label"], cold))
             per_device_scores.append(cold)
 
     if not averages:
@@ -237,43 +259,43 @@ def _build_insights(runtime_rows: List[Dict[str, Any]], startup_rows: List[Dict[
 
     critical_fps = [row for row in runtime_rows if isinstance(row.get("fps"), float) and row["fps"] < 20.0]
     if critical_fps:
-        names = ", ".join(row["device"] for row in critical_fps[:4])
+        names = ", ".join(row["device_label"] for row in critical_fps[:4])
         insights.append(f"Critical FPS (<20) detected on: {names}.")
 
     low_fps = [
         row for row in runtime_rows if isinstance(row.get("fps"), float) and 20.0 <= row["fps"] < 30.0
     ]
     if low_fps:
-        names = ", ".join(row["device"] for row in low_fps[:4])
+        names = ", ".join(row["device_label"] for row in low_fps[:4])
         insights.append(f"Low FPS detected (<30) on: {names}.")
 
     high_gc = [row for row in runtime_rows if isinstance(row.get("gc_count"), float) and row["gc_count"] >= 30]
     if high_gc:
-        names = ", ".join(row["device"] for row in high_gc[:4])
+        names = ", ".join(row["device_label"] for row in high_gc[:4])
         insights.append(f"High GC activity detected on: {names}.")
 
     for row in startup_rows:
         cold, warm = row.get("cold_avg"), row.get("warm_avg")
         hot = row.get("hot_avg")
         if isinstance(cold, float) and cold > 3000.0:
-            insights.append(f"{row['device']} cold start is critical (>3000 ms).")
+            insights.append(f"{row['device_label']} cold start is critical (>3000 ms).")
         elif isinstance(cold, float) and cold > 1500.0:
-            insights.append(f"{row['device']} cold start is elevated (>1500 ms).")
+            insights.append(f"{row['device_label']} cold start is elevated (>1500 ms).")
         if isinstance(cold, float) and isinstance(warm, float) and warm > 0 and (cold / warm) > 5.0:
-            insights.append(f"{row['device']} cold/warm ratio is >5x; investigate initialization path.")
+            insights.append(f"{row['device_label']} cold/warm ratio is >5x; investigate initialization path.")
         if isinstance(hot, float) and isinstance(warm, float) and hot > warm:
-            insights.append(f"{row['device']} hot start is slower than warm start (anomaly).")
+            insights.append(f"{row['device_label']} hot start is slower than warm start (anomaly).")
 
     high_cpu = [row for row in runtime_rows if isinstance(row.get("cpu"), float) and row["cpu"] > 60.0]
     if high_cpu:
-        names = ", ".join(row["device"] for row in high_cpu[:4])
+        names = ", ".join(row["device_label"] for row in high_cpu[:4])
         insights.append(f"High CPU usage (>60%) detected on: {names}.")
 
     all_runtime_na = [
         row for row in runtime_rows if not isinstance(row.get("cpu"), float) and not isinstance(row.get("memory"), float) and not isinstance(row.get("fps"), float)
     ]
     if all_runtime_na:
-        names = ", ".join(row["device"] for row in all_runtime_na[:4])
+        names = ", ".join(row["device_label"] for row in all_runtime_na[:4])
         insights.append(
             f"Runtime CPU/Memory/FPS are all N/A on: {names}. App was likely not in foreground during sampling; keep it active and rerun."
         )
@@ -287,18 +309,18 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
     def _cpu_class(cpu: float | None) -> str:
         if not isinstance(cpu, float):
             return ""
-        if cpu > 80:
-            return "metric-critical"
         if cpu > 60:
+            return "metric-critical"
+        if cpu >= 40:
             return "metric-warning"
         return "metric-good"
 
     def _fps_class(fps: float | None) -> str:
         if not isinstance(fps, float):
             return ""
-        if fps < 30:
+        if fps < 20:
             return "metric-critical"
-        if fps < 45:
+        if fps < 30:
             return "metric-warning"
         return "metric-good"
 
@@ -323,12 +345,12 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
         status_cell = f'<span class="badge badge-critical">{escape(row["error"])}</span>' if row["error"] else '<span class="badge badge-good">Healthy</span>'
         rows_html.append(
             "<tr>"
-            f"<td>{escape(row['device'])}</td>"
-            f"<td class=\"{_cpu_class(row['cpu'])}\" title=\"CPU usage percentage during runtime. >60% indicates elevated load.\">{cpu_cell}</td>"
-            f"<td title=\"Average memory usage in MB while app is active.\">{memory_cell}</td>"
-            f"<td class=\"{_fps_class(row['fps'])}\" title=\"Frames per second. Values below 30 FPS are critical for smooth UX.\">{fps_cell}</td>"
-            f"<td title=\"Garbage collection cycles observed during sampling.\">{gc_cell}</td>"
-            f"<td>{status_cell}</td>"
+            f"<td title=\"Test device (manufacturer + model)\">{escape(row['device_label'])}</td>"
+            f"<td class=\"{_cpu_class(row['cpu'])}\" title=\"CPU usage % of the app process during the runtime sampling window. >40% = warning, >60% = critical.\">{cpu_cell}</td>"
+            f"<td title=\"Average PSS memory used by the app in MB. High values risk LMK kills on low-RAM devices.\">{memory_cell}</td>"
+            f"<td class=\"{_fps_class(row['fps'])}\" title=\"Rendered frames per second during the gfxinfo sampling window. <30 fps = warning (amber), <20 fps = critical (red).\">{fps_cell}</td>"
+            f"<td title=\"Number of garbage collection events observed in logcat during the benchmark. Frequent GC can cause frame drops.\">{gc_cell}</td>"
+            f"<td title=\"Overall health: Healthy = all metrics within limits. Warning = at least one metric in amber range. Degraded = at least one metric in red range. No Data = runtime collection failed.\">{status_cell}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
@@ -349,12 +371,21 @@ def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
 
     rows_html: List[str] = []
     for row in rows:
+        cold_values = row.get("cold_values", [])
+        warm_values = row.get("warm_values", [])
+        hot_values = row.get("hot_values", [])
+
+        def _spread_title(values: List[float]) -> str:
+            if values:
+                return f"min={int(min(values))} ms, max={int(max(values))} ms, samples={len(values)}"
+            return "min=N/A ms, max=N/A ms, samples=0"
+
         rows_html.append(
             "<tr>"
-            f"<td>{escape(row['device'])}</td>"
-            f"<td class=\"{_perf_class_startup(row['cold_avg'])}\">{_fmt_num(row['cold_avg'])}</td>"
-            f"<td class=\"{_perf_class_startup(row['warm_avg'])}\">{_fmt_num(row['warm_avg'])}</td>"
-            f"<td class=\"{_perf_class_startup(row['hot_avg'])}\">{_fmt_num(row['hot_avg'])}</td>"
+            f"<td title=\"Test device (manufacturer + model)\">{escape(row['device_label'])}</td>"
+            f"<td class=\"{_perf_class_startup(row['cold_avg'])}\" title=\"{escape(_spread_title(cold_values))}\">{_fmt_num(row['cold_avg'])}</td>"
+            f"<td class=\"{_perf_class_startup(row['warm_avg'])}\" title=\"{escape(_spread_title(warm_values))}\">{_fmt_num(row['warm_avg'])}</td>"
+            f"<td class=\"{_perf_class_startup(row['hot_avg'])}\" title=\"{escape(_spread_title(hot_values))}\">{_fmt_num(row['hot_avg'])}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
@@ -376,7 +407,7 @@ def _device_rows_html(rows: List[Dict[str, Any]]) -> str:
         lines.append(
             '<article class="device-card">'
             '<div class="device-card-header">'
-            f"<div><h3>{escape(row['device'])}</h3><p>{escape(row['manufacturer'])} · {escape(row['model'])}</p></div>"
+            f"<div><h3>{escape(row['device_label'])}</h3><p>{escape(row['manufacturer'])} · {escape(row['model'])}</p></div>"
             f"<span class=\"status-pill {status_class}\"><span class=\"status-dot\"></span>{status_text}</span>"
             "</div>"
             '<div class="device-meta">'
@@ -422,13 +453,13 @@ def _chart_payload(
             out.append(None)
         return out
 
-    device_labels = [row["device"] for row in startup_rows]
+    device_labels = [row["device_label"] for row in startup_rows]
     device_avg_values = [
         round(row["cold_avg"], 2) if isinstance(row.get("cold_avg"), float) else None
         for row in startup_rows
     ]
 
-    runtime_labels = [row["device"] for row in runtime_rows]
+    runtime_labels = [row["device_label"] for row in runtime_rows]
     cpu_values = [round(row["cpu"], 2) if isinstance(row["cpu"], float) else None for row in runtime_rows]
     memory_values = [round(row["memory"], 2) if isinstance(row["memory"], float) else None for row in runtime_rows]
 
@@ -725,12 +756,12 @@ def _html_report(
   <p class=\"subtitle\">Tooltips explain each metric. FPS below 30 is marked critical.</p>
   <div class=\"table-wrap\"><table>
     <tr>
-      <th title=\"Unique test device identifier\">Device</th>
-      <th title=\"CPU load percentage while running scenario\">CPU (%)</th>
-      <th title=\"Average resident memory usage\">Memory (MB)</th>
-      <th title=\"Frames per second under workload\">FPS</th>
-      <th title=\"Garbage collection cycles observed\">GC Count</th>
-      <th title=\"Collection and runtime state\">Status</th>
+      <th title=\"Test device (manufacturer + model)\">Device</th>
+      <th title=\"CPU usage % of the app process during the runtime sampling window. >40% = warning, >60% = critical.\">CPU (%)</th>
+      <th title=\"Average PSS memory used by the app in MB. High values risk LMK kills on low-RAM devices.\">Memory (MB)</th>
+      <th title=\"Rendered frames per second during the gfxinfo sampling window. <30 fps = warning (amber), <20 fps = critical (red).\">FPS</th>
+      <th title=\"Number of garbage collection events observed in logcat during the benchmark. Frequent GC can cause frame drops.\">GC Count</th>
+      <th title=\"Overall health: Healthy = all metrics within limits. Warning = at least one metric in amber range. Degraded = at least one metric in red range. No Data = runtime collection failed.\">Status</th>
     </tr>
     {runtime_rows}
   </table></div>
@@ -740,10 +771,10 @@ def _html_report(
   <h2>Startup Performance</h2>
   <div class=\"table-wrap\"><table>
     <tr>
-      <th>Device</th>
-      <th title=\"Initial app launch after process cold start\">Cold Avg (ms)</th>
-      <th title=\"App relaunch with cached process\">Warm Avg (ms)</th>
-      <th title=\"App relaunch from hot state\">Hot Avg (ms)</th>
+      <th title=\"Test device (manufacturer + model)\">Device</th>
+      <th title=\"Average launch time after force-stopping the app. Measures full process creation + Activity onCreate. >1500 ms = warning, >3000 ms = critical.\">Cold Avg (ms)</th>
+      <th title=\"Average launch time when the process is already alive but the Activity was backgrounded via HOME. Measures Activity re-creation only.\">Warm Avg (ms)</th>
+      <th title=\"Average launch time when the Activity is brought back from brief background. Should be the fastest of the three. N/A means all samples were 0 ms (activity was already resumed).\">Hot Avg (ms)</th>
     </tr>
     {startup_rows}
   </table></div>
