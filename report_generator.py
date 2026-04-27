@@ -170,11 +170,10 @@ def _build_summary(startup_rows: List[Dict[str, Any]]) -> Dict[str, str]:
     per_device_scores: List[float] = []
 
     for row in startup_rows:
-        parts = [v for v in [row["cold_avg"], row["warm_avg"], row["hot_avg"]] if isinstance(v, float)]
-        if parts:
-            device_avg = sum(parts) / len(parts)
-            averages.append((row["device"], device_avg))
-            per_device_scores.append(device_avg)
+        cold = row.get("cold_avg")
+        if isinstance(cold, float):
+            averages.append((row["device"], cold))
+            per_device_scores.append(cold)
 
     if not averages:
         return {
@@ -236,7 +235,14 @@ def _build_insights(runtime_rows: List[Dict[str, Any]], startup_rows: List[Dict[
     if failed:
         insights.append(f"{len(failed)} device(s) reported runtime/startup errors.")
 
-    low_fps = [row for row in runtime_rows if isinstance(row.get("fps"), float) and row["fps"] < 30.0]
+    critical_fps = [row for row in runtime_rows if isinstance(row.get("fps"), float) and row["fps"] < 20.0]
+    if critical_fps:
+        names = ", ".join(row["device"] for row in critical_fps[:4])
+        insights.append(f"Critical FPS (<20) detected on: {names}.")
+
+    low_fps = [
+        row for row in runtime_rows if isinstance(row.get("fps"), float) and 20.0 <= row["fps"] < 30.0
+    ]
     if low_fps:
         names = ", ".join(row["device"] for row in low_fps[:4])
         insights.append(f"Low FPS detected (<30) on: {names}.")
@@ -248,8 +254,29 @@ def _build_insights(runtime_rows: List[Dict[str, Any]], startup_rows: List[Dict[
 
     for row in startup_rows:
         cold, warm = row.get("cold_avg"), row.get("warm_avg")
-        if isinstance(cold, float) and isinstance(warm, float) and warm > 0 and cold > warm * 1.3:
-            insights.append(f"{row['device']} has cold start >30% slower than warm start.")
+        hot = row.get("hot_avg")
+        if isinstance(cold, float) and cold > 3000.0:
+            insights.append(f"{row['device']} cold start is critical (>3000 ms).")
+        elif isinstance(cold, float) and cold > 1500.0:
+            insights.append(f"{row['device']} cold start is elevated (>1500 ms).")
+        if isinstance(cold, float) and isinstance(warm, float) and warm > 0 and (cold / warm) > 5.0:
+            insights.append(f"{row['device']} cold/warm ratio is >5x; investigate initialization path.")
+        if isinstance(hot, float) and isinstance(warm, float) and hot > warm:
+            insights.append(f"{row['device']} hot start is slower than warm start (anomaly).")
+
+    high_cpu = [row for row in runtime_rows if isinstance(row.get("cpu"), float) and row["cpu"] > 60.0]
+    if high_cpu:
+        names = ", ".join(row["device"] for row in high_cpu[:4])
+        insights.append(f"High CPU usage (>60%) detected on: {names}.")
+
+    all_runtime_na = [
+        row for row in runtime_rows if not isinstance(row.get("cpu"), float) and not isinstance(row.get("memory"), float) and not isinstance(row.get("fps"), float)
+    ]
+    if all_runtime_na:
+        names = ", ".join(row["device"] for row in all_runtime_na[:4])
+        insights.append(
+            f"Runtime CPU/Memory/FPS are all N/A on: {names}. App was likely not in foreground during sampling; keep it active and rerun."
+        )
 
     return insights if insights else ["No major anomalies detected from available metrics."]
 
@@ -383,18 +410,21 @@ def _chart_payload(
 
     max_points = max(len(cold_values), len(warm_values), len(hot_values), 0)
 
-    def _pad_nullable(values: List[float], target: int) -> List[float | None]:
-        out: List[float | None] = [round(v, 2) for v in values[:target]]
+    def _pad_nullable(values: List[float], target: int, null_non_positive: bool = False) -> List[float | None]:
+        out: List[float | None] = []
+        for value in values[:target]:
+            rounded = round(value, 2)
+            if null_non_positive and rounded <= 0:
+                out.append(None)
+            else:
+                out.append(rounded)
         while len(out) < target:
             out.append(None)
         return out
 
     device_labels = [row["device"] for row in startup_rows]
     device_avg_values = [
-        round(
-            _avg([value for value in [row["cold_avg"], row["warm_avg"], row["hot_avg"]] if isinstance(value, float)]) or 0.0,
-            2,
-        )
+        round(row["cold_avg"], 2) if isinstance(row.get("cold_avg"), float) else None
         for row in startup_rows
     ]
 
@@ -405,8 +435,14 @@ def _chart_payload(
     return {
         "startup_metrics": {
             "cold": {"avg": round(cold_avg, 2) if cold_avg is not None else None, "values": _pad_nullable(cold_values, max_points)},
-            "warm": {"avg": round(warm_avg, 2) if warm_avg is not None else None, "values": _pad_nullable(warm_values, max_points)},
-            "hot": {"avg": round(hot_avg, 2) if hot_avg is not None else None, "values": _pad_nullable(hot_values, max_points)},
+            "warm": {
+                "avg": round(warm_avg, 2) if warm_avg is not None else None,
+                "values": _pad_nullable(warm_values, max_points, null_non_positive=True),
+            },
+            "hot": {
+                "avg": round(hot_avg, 2) if hot_avg is not None else None,
+                "values": _pad_nullable(hot_values, max_points, null_non_positive=True),
+            },
             "labels": list(range(1, max_points + 1)),
         },
         "device_metrics": {"labels": device_labels, "startup_avg_ms": device_avg_values},
@@ -810,7 +846,7 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
   const hotTrend = toNumberArray(startupMetrics?.hot?.values);
 
   const labels = Array.isArray(data.device_metrics?.labels) ? data.device_metrics.labels : [];
-  const values = toNumberArray(data.device_metrics?.startup_avg_ms).filter((value) => typeof value === 'number');
+  const values = toNumberArray(data.device_metrics?.startup_avg_ms);
   const runtimeLabels = Array.isArray(data.runtime_metrics?.labels) ? data.runtime_metrics.labels : [];
   const runtimeCpu = toNumberArray(data.runtime_metrics?.cpu_percent);
   const runtimeMemory = toNumberArray(data.runtime_metrics?.memory_mb);
@@ -856,9 +892,9 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
         data: {{
           labels: Array.isArray(startupMetrics?.labels) ? startupMetrics.labels : [],
           datasets: [
-            {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', tension: 0.35, fill: false }},
-            {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', tension: 0.35, fill: false }},
-            {{ label: 'Hot', data: hotTrend, borderColor: '#22c55e', tension: 0.35, fill: false }}
+            {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', tension: 0.35, fill: false, spanGaps: true }},
+            {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', tension: 0.35, fill: false, spanGaps: true }},
+            {{ label: 'Hot', data: hotTrend, borderColor: '#22c55e', tension: 0.35, fill: false, spanGaps: true }}
           ]
         }},
         options: {{

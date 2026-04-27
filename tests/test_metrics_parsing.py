@@ -19,6 +19,10 @@ class PerformanceCollectorParsingTests(unittest.TestCase):
         output = "1234 18 com.example.app"
         self.assertEqual(performance_collector.parse_cpu_usage(output, "com.example.app"), 18.0)
 
+    def test_parse_cpu_usage_strips_ansi(self) -> None:
+        output = "\x1b[31m1234 18% S com.example.app\x1b[0m"
+        self.assertEqual(performance_collector.parse_cpu_usage(output, "com.example.app"), 18.0)
+
     def test_parse_cpu_usage_cpuinfo_with_suffix(self) -> None:
         output = "  6.1% 1234/com.example.app:service 4.2% user + 1.9% kernel"
         self.assertEqual(performance_collector.parse_cpu_usage_cpuinfo(output, "com.example.app"), 6.1)
@@ -90,6 +94,15 @@ class PerformanceCollectorParsingTests(unittest.TestCase):
         self.assertEqual(validated["startup_metrics"]["cold"]["values"], [100.0])
         self.assertEqual(validated["startup_metrics"]["cold"]["avg"], 100.0)
 
+    def test_validate_benchmark_result_discards_zero_startup_values(self) -> None:
+        raw = {
+            "runtime_metrics": {"cpu": 20.0, "memory": 100.0, "fps": 50.0, "gc_count": 0},
+            "startup_metrics": {"hot": {"values": [0.0, 120.0]}, "warm": {"values": [0, 0.0]}, "cold": {"values": [1500]}},
+        }
+        validated = performance_collector.validate_benchmark_result(raw, "device-1")
+        self.assertEqual(validated["startup_metrics"]["hot"]["values"], [120.0])
+        self.assertEqual(validated["startup_metrics"]["warm"]["values"], [])
+
 
 class ReportGeneratorPayloadTests(unittest.TestCase):
     def test_chart_payload_uses_nullable_padding(self) -> None:
@@ -109,6 +122,23 @@ class ReportGeneratorPayloadTests(unittest.TestCase):
         self.assertEqual(payload["startup_metrics"]["cold"]["values"], [1000.0, 1100.0])
         self.assertEqual(payload["startup_metrics"]["warm"]["values"], [900.0, None])
         self.assertEqual(payload["startup_metrics"]["hot"]["values"], [None, None])
+
+    def test_chart_payload_nulls_non_positive_warm_hot_and_uses_cold_device_avg(self) -> None:
+        rows = [
+            {
+                "device": "d1",
+                "cold_avg": 1200.0,
+                "warm_avg": 900.0,
+                "hot_avg": 700.0,
+                "cold_values": [1000.0],
+                "warm_values": [0.0],
+                "hot_values": [-1.0],
+            }
+        ]
+        payload = report_generator._chart_payload(rows)
+        self.assertEqual(payload["startup_metrics"]["warm"]["values"], [None])
+        self.assertEqual(payload["startup_metrics"]["hot"]["values"], [None])
+        self.assertEqual(payload["device_metrics"]["startup_avg_ms"], [1200.0])
 
     def test_collect_rows_supports_legacy_warm_start_keys(self) -> None:
         devices = {

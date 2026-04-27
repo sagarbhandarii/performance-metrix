@@ -192,6 +192,7 @@ def get_devices() -> Iterable[Dict[str, object]]:
 
 
 def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
+    top_output = _strip_ansi(top_output)
     for line in top_output.splitlines():
         if package_name not in line:
             continue
@@ -218,6 +219,10 @@ def parse_cpu_usage(top_output: str, package_name: str) -> MetricValue:
                     _debug_log(f"Parsed CPU from line (generic token): {line} => {value}")
                     return value
     return "N/A"
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[^[\\]", "", text)
 
 
 def parse_cpu_usage_cpuinfo(cpuinfo_output: str, package_name: str) -> MetricValue:
@@ -440,7 +445,9 @@ def collect_cpu_average(
 
     start_time = time.monotonic()
     for idx in range(sample_count):
-        top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
+        top = run_adb_command(["adb", "-s", target, "shell", "top", "-b", "-n", "1"], timeout=15, device_id=target)
+        if top["success"] and not str(top.get("output", "")).strip():
+            top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
         cpu = parse_cpu_usage(top["output"], package_name) if top["success"] else "N/A"
         if cpu == "N/A":
             cpuinfo = run_adb_command(
@@ -482,16 +489,21 @@ def _start_app_with_retry(target: str, component: str, timeout: int = 20, attemp
 
 def run_start_test(device: str, start_type: str, component: str, package: str, iterations: int = 10) -> Dict[str, Any]:
     values: List[float] = []
+    if start_type == "warm":
+        _start_app_with_retry(device, component, timeout=20, attempts=2)
+
     for i in range(1, iterations + 1):
         _debug_log(f"[{device}] {start_type} iteration {i}/{iterations}")
 
         if start_type == "cold":
             run_adb_command(["adb", "-s", device, "shell", "am", "force-stop", package], timeout=10, device_id=device)
+            time.sleep(1.5)
         elif start_type == "warm":
-            run_adb_command(["adb", "-s", device, "shell", "am", "start", "-n", component], timeout=15, device_id=device)
             run_adb_command(["adb", "-s", device, "shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10, device_id=device)
+            time.sleep(0.8)
         elif start_type == "hot":
-            run_adb_command(["adb", "-s", device, "shell", "am", "start", "-n", component], timeout=15, device_id=device)
+            run_adb_command(["adb", "-s", device, "shell", "input", "keyevent", "KEYCODE_HOME"], timeout=10, device_id=device)
+            time.sleep(0.3)
         else:
             raise ValueError(f"Unknown start type: {start_type}")
 
@@ -499,8 +511,10 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
         if launch["success"]:
             parsed = parse_launch_times(launch["output"])
             total = parsed.get("TotalTime")
-            if isinstance(total, int):
+            if isinstance(total, int) and total > 0:
                 values.append(float(total))
+            elif isinstance(total, int):
+                _debug_log(f"[{device}] Discarded non-positive {start_type} sample at iteration {i}: {total}")
 
         time.sleep(2)
 
@@ -527,7 +541,9 @@ def collect_performance_metrics(
     else:
         launch = {"success": True, "output": "", "error": ""}
 
-    top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
+    top = run_adb_command(["adb", "-s", target, "shell", "top", "-b", "-n", "1"], timeout=15, device_id=target)
+    if top["success"] and not str(top.get("output", "")).strip():
+        top = run_adb_command(["adb", "-s", target, "shell", "top", "-n", "1"], timeout=15, device_id=target)
     cpuinfo = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "cpuinfo", package_name], timeout=15, device_id=target)
     mem = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "meminfo", package_name], timeout=15, device_id=target)
     gfx = run_adb_command(["adb", "-s", target, "shell", "dumpsys", "gfxinfo", package_name], timeout=20, device_id=target)
@@ -543,10 +559,18 @@ def collect_performance_metrics(
     cpu = parse_cpu_usage(top["output"], package_name) if top["success"] else "N/A"
     if cpu == "N/A" and cpuinfo["success"]:
         cpu = parse_cpu_usage_cpuinfo(cpuinfo["output"], package_name)
-    memory_metrics = parse_memory_metrics(mem["output"]) if mem["success"] else {"total_mb": "N/A", "total_pss_mb": "N/A", "total_rss_mb": "N/A"}
+    mem_output = str(mem.get("output", ""))
+    gfx_output = str(gfx.get("output", ""))
+    mem_no_process = "no process found" in mem_output.lower()
+    gfx_no_process = "no process found" in gfx_output.lower()
+    memory_metrics = (
+        {"total_mb": "N/A", "total_pss_mb": "N/A", "total_rss_mb": "N/A"}
+        if (not mem["success"] or mem_no_process)
+        else parse_memory_metrics(mem_output)
+    )
     memory = memory_metrics.get("total_mb", "N/A")
     launch_times = parse_launch_times(launch["output"]) if launch["success"] else {"ThisTime": "N/A", "TotalTime": "N/A", "WaitTime": "N/A"}
-    fps = parse_fps(gfx["output"]) if gfx["success"] else "N/A"
+    fps = "N/A" if (not gfx["success"] or gfx_no_process) else parse_fps(gfx_output)
     if fps == "N/A" and sf_latency["success"]:
         fps = parse_surfaceflinger_fps(sf_latency["output"])
 
@@ -665,9 +689,13 @@ def validate_benchmark_result(result: Dict[str, Any], target: str) -> Dict[str, 
         if not isinstance(bucket, dict):
             startup[mode] = {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"}
             continue
-        values = [float(v) for v in bucket.get("values", []) if isinstance(v, (int, float)) and v >= 0]
+        original_values = bucket.get("values", [])
+        values = [float(v) for v in original_values if isinstance(v, (int, float)) and v > 0]
         if len(values) != len(bucket.get("values", [])):
             LOGGER.warning("[%s] startup %s had invalid values; filtered.", target, mode)
+        discarded_zeros = sum(1 for v in original_values if isinstance(v, (int, float)) and float(v) == 0.0)
+        if discarded_zeros:
+            LOGGER.info("[%s] startup %s discarded %d zero samples.", target, mode, discarded_zeros)
         bucket["values"] = values
         if values:
             bucket["avg"] = round(_avg_of_values(values), 2)
