@@ -60,15 +60,19 @@ def _fmt_num(value: Any, digits: int = 2) -> str:
         return "N/A"
 
 
-def _as_list(values: Any) -> List[float]:
+def _as_nullable_list(values: Any) -> List[float | None]:
     if not isinstance(values, list):
         return []
-    out: List[float] = []
+    out: List[float | None] = []
     for value in values:
-        try:
-            out.append(float(value))
-        except (TypeError, ValueError):
+        if value is None:
+            out.append(None)
             continue
+        try:
+            number = float(value)
+            out.append(number if number > 0 else None)
+        except (TypeError, ValueError):
+            out.append(None)
     return out
 
 
@@ -159,9 +163,9 @@ def _collect_rows(devices: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, An
                 "cold_avg": _metric_value(cold, "avg", "average"),
                 "warm_avg": _metric_value(warm, "avg", "average"),
                 "hot_avg": _metric_value(hot, "avg", "average"),
-                "cold_values": _as_list(cold.get("values") or cold.get("samples")),
-                "warm_values": _as_list(warm.get("values") or warm.get("samples")),
-                "hot_values": _as_list(hot.get("values") or hot.get("samples")),
+                "cold_values": _as_nullable_list(cold.get("values") if "values" in cold else cold.get("samples")),
+                "warm_values": _as_nullable_list(warm.get("values") if "values" in warm else warm.get("samples")),
+                "hot_values": _as_nullable_list(hot.get("values") if "values" in hot else hot.get("samples")),
             }
         )
 
@@ -358,7 +362,7 @@ def _runtime_rows_html(rows: List[Dict[str, Any]]) -> str:
 
 def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "<tr><td colspan=\"4\">No startup data available</td></tr>"
+        return "<tr><td colspan=\"7\">No startup data available</td></tr>"
 
     def _perf_class_startup(startup_ms: float | None) -> str:
         if not isinstance(startup_ms, float):
@@ -375,17 +379,34 @@ def _startup_rows_html(rows: List[Dict[str, Any]]) -> str:
         warm_values = row.get("warm_values", [])
         hot_values = row.get("hot_values", [])
 
-        def _spread_title(values: List[float]) -> str:
-            if values:
-                return f"min={int(min(values))} ms, max={int(max(values))} ms, samples={len(values)}"
-            return "min=N/A ms, max=N/A ms, samples=0"
+        def _spread_title(values: List[float | None]) -> str:
+            valid_values = [v for v in values if isinstance(v, float)]
+            if valid_values:
+                return f"min={int(min(valid_values))} ms, max={int(max(valid_values))} ms, samples={len(valid_values)}/{len(values)}"
+            return f"min=N/A ms, max=N/A ms, samples=0/{len(values)}"
+
+        def _samples_cell(values: List[float | None]) -> str:
+            total = len(values)
+            valid = sum(1 for value in values if isinstance(value, float))
+            if total <= 0:
+                badge_class = "badge-neutral"
+            elif valid == total:
+                badge_class = "badge-good"
+            elif valid >= total * 0.7:
+                badge_class = "badge-warn"
+            else:
+                badge_class = "badge-critical"
+            return f'<span class="badge {badge_class}">{valid}/{total}</span>'
 
         rows_html.append(
             "<tr>"
             f"<td title=\"Test device (manufacturer + model)\">{escape(row['device_label'])}</td>"
             f"<td class=\"{_perf_class_startup(row['cold_avg'])}\" title=\"{escape(_spread_title(cold_values))}\">{_fmt_num(row['cold_avg'])}</td>"
+            f"<td title=\"Valid cold samples over total configured iterations.\">{_samples_cell(cold_values)}</td>"
             f"<td class=\"{_perf_class_startup(row['warm_avg'])}\" title=\"{escape(_spread_title(warm_values))}\">{_fmt_num(row['warm_avg'])}</td>"
+            f"<td title=\"Valid warm samples over total configured iterations.\">{_samples_cell(warm_values)}</td>"
             f"<td class=\"{_perf_class_startup(row['hot_avg'])}\" title=\"{escape(_spread_title(hot_values))}\">{_fmt_num(row['hot_avg'])}</td>"
+            f"<td title=\"Valid hot samples over total configured iterations.\">{_samples_cell(hot_values)}</td>"
             "</tr>"
         )
     return "\n".join(rows_html)
@@ -431,27 +452,21 @@ def _chart_payload(
     warm_avg = _avg([row["warm_avg"] for row in startup_rows if isinstance(row["warm_avg"], float)])
     hot_avg = _avg([row["hot_avg"] for row in startup_rows if isinstance(row["hot_avg"], float)])
 
-    cold_values: List[float] = []
-    warm_values: List[float] = []
-    hot_values: List[float] = []
-    for row in startup_rows:
-        cold_values.extend(row["cold_values"])
-        warm_values.extend(row["warm_values"])
-        hot_values.extend(row["hot_values"])
-
-    max_points = max(len(cold_values), len(warm_values), len(hot_values), 0)
-
-    def _pad_nullable(values: List[float], target: int, null_non_positive: bool = False) -> List[float | None]:
-        out: List[float | None] = []
-        for value in values[:target]:
-            rounded = round(value, 2)
-            if null_non_positive and rounded <= 0:
-                out.append(None)
-            else:
-                out.append(rounded)
+    def _pad_to(values: List[float | None], target: int) -> List[float | None]:
+        out = [round(value, 2) if isinstance(value, float) else None for value in values[:target]]
         while len(out) < target:
             out.append(None)
         return out
+
+    cold_series = [row.get("cold_values", []) for row in startup_rows]
+    warm_series = [row.get("warm_values", []) for row in startup_rows]
+    hot_series = [row.get("hot_values", []) for row in startup_rows]
+    all_series = cold_series + warm_series + hot_series
+    max_points = max((len(series) for series in all_series), default=0)
+
+    cold_series = [_pad_to(series, max_points) for series in cold_series]
+    warm_series = [_pad_to(series, max_points) for series in warm_series]
+    hot_series = [_pad_to(series, max_points) for series in hot_series]
 
     device_labels = [row["device_label"] for row in startup_rows]
     device_avg_values = [
@@ -465,16 +480,12 @@ def _chart_payload(
 
     return {
         "startup_metrics": {
-            "cold": {"avg": round(cold_avg, 2) if cold_avg is not None else None, "values": _pad_nullable(cold_values, max_points)},
-            "warm": {
-                "avg": round(warm_avg, 2) if warm_avg is not None else None,
-                "values": _pad_nullable(warm_values, max_points, null_non_positive=True),
-            },
-            "hot": {
-                "avg": round(hot_avg, 2) if hot_avg is not None else None,
-                "values": _pad_nullable(hot_values, max_points, null_non_positive=True),
-            },
+            "cold": {"avg": round(cold_avg, 2) if cold_avg is not None else None},
+            "warm": {"avg": round(warm_avg, 2) if warm_avg is not None else None},
+            "hot": {"avg": round(hot_avg, 2) if hot_avg is not None else None},
             "labels": list(range(1, max_points + 1)),
+            "devices": device_labels,
+            "per_device_series": {"cold": cold_series, "warm": warm_series, "hot": hot_series},
         },
         "device_metrics": {"labels": device_labels, "startup_avg_ms": device_avg_values},
         "runtime_metrics": {"labels": runtime_labels, "cpu_percent": cpu_values, "memory_mb": memory_values},
@@ -773,8 +784,11 @@ def _html_report(
     <tr>
       <th title=\"Test device (manufacturer + model)\">Device</th>
       <th title=\"Average launch time after force-stopping the app. Measures full process creation + Activity onCreate. >1500 ms = warning, >3000 ms = critical.\">Cold Avg (ms)</th>
+      <th title=\"Valid cold samples / total configured iterations.\">Samples</th>
       <th title=\"Average launch time when the process is already alive but the Activity was backgrounded via HOME. Measures Activity re-creation only.\">Warm Avg (ms)</th>
+      <th title=\"Valid warm samples / total configured iterations.\">Samples</th>
       <th title=\"Average launch time when the Activity is brought back from brief background. Should be the fastest of the three. N/A means all samples were 0 ms (activity was already resumed).\">Hot Avg (ms)</th>
+      <th title=\"Valid hot samples / total configured iterations.\">Samples</th>
     </tr>
     {startup_rows}
   </table></div>
@@ -791,7 +805,7 @@ def _html_report(
       </div>
     </div>
     <div class=\"chart-panel\" id=\"linePanel\">
-      <h3>Launch Time Trend</h3>
+      <h3>Warm Start Trend by Device</h3>
       <div class=\"chart-container\">
         <canvas id=\"lineChart\"></canvas>
         <div class=\"chart-message\" id=\"lineChartMessage\">No data available.</div>
@@ -872,9 +886,11 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
   const warmAvg = Number(startupMetrics?.warm?.avg);
   const hotAvg = Number(startupMetrics?.hot?.avg);
   const barValues = [coldAvg, warmAvg, hotAvg].map((value) => (Number.isFinite(value) ? value : null));
-  const coldTrend = toNumberArray(startupMetrics?.cold?.values);
-  const warmTrend = toNumberArray(startupMetrics?.warm?.values);
-  const hotTrend = toNumberArray(startupMetrics?.hot?.values);
+  const startupLabels = Array.isArray(startupMetrics?.labels) ? startupMetrics.labels : [];
+  const startupDevices = Array.isArray(startupMetrics?.devices) ? startupMetrics.devices : [];
+  const warmPerDeviceSeries = Array.isArray(startupMetrics?.per_device_series?.warm)
+    ? startupMetrics.per_device_series.warm.map((series) => toNumberArray(series))
+    : [];
 
   const labels = Array.isArray(data.device_metrics?.labels) ? data.device_metrics.labels : [];
   const values = toNumberArray(data.device_metrics?.startup_avg_ms);
@@ -917,16 +933,32 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
   }}
 
   try {{
-    if (hasPositiveValue(coldTrend) || hasPositiveValue(warmTrend) || hasPositiveValue(hotTrend)) {{
+    const palette = ['#ef4444', '#f59e0b', '#22c55e', '#3b82f6', '#a855f7', '#14b8a6', '#f97316', '#e11d48'];
+    const warmDatasets = warmPerDeviceSeries
+      .map((series, index) => {{
+        const color = palette[index % palette.length];
+        const hasData = series.some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
+        if (!hasData) return null;
+        const hasGap = series.some((value) => value === null);
+        return {{
+          label: startupDevices[index] || `Device ${{index + 1}}`,
+          data: series,
+          borderColor: color,
+          backgroundColor: color,
+          borderDash: hasGap ? [6, 4] : [],
+          tension: 0.35,
+          fill: false,
+          spanGaps: true
+        }};
+      }})
+      .filter(Boolean);
+
+    if (warmDatasets.length > 0) {{
       new Chart(ctx2, {{
         type: 'line',
         data: {{
-          labels: Array.isArray(startupMetrics?.labels) ? startupMetrics.labels : [],
-          datasets: [
-            {{ label: 'Cold', data: coldTrend, borderColor: '#ef4444', tension: 0.35, fill: false, spanGaps: true }},
-            {{ label: 'Warm', data: warmTrend, borderColor: '#f59e0b', tension: 0.35, fill: false, spanGaps: true }},
-            {{ label: 'Hot', data: hotTrend, borderColor: '#22c55e', tension: 0.35, fill: false, spanGaps: true }}
-          ]
+          labels: startupLabels,
+          datasets: warmDatasets
         }},
         options: {{
           responsive: true,
@@ -942,7 +974,7 @@ document.addEventListener(\"DOMContentLoaded\", function () {{
         }}
       }});
     }} else {{
-      console.warn(`${{reportPrefix}} No startup trend samples for line chart.`);
+      console.warn(`${{reportPrefix}} No warm startup trend samples for line chart.`);
       setPanelMessage(linePanel, 'No data available.', false);
     }}
   }} catch (error) {{
