@@ -488,12 +488,13 @@ def _start_app_with_retry(target: str, component: str, timeout: int = 20, attemp
 
 
 def run_start_test(device: str, start_type: str, component: str, package: str, iterations: int = 10) -> Dict[str, Any]:
-    values: List[float] = []
+    slots: List[float | None] = [None] * iterations
     if start_type == "warm":
         _start_app_with_retry(device, component, timeout=20, attempts=2)
 
-    for i in range(1, iterations + 1):
-        _debug_log(f"[{device}] {start_type} iteration {i}/{iterations}")
+    for slot_index in range(iterations):
+        iteration = slot_index + 1
+        _debug_log(f"[{device}] {start_type} iteration {iteration}/{iterations}")
 
         if start_type == "cold":
             run_adb_command(["adb", "-s", device, "shell", "am", "force-stop", package], timeout=10, device_id=device)
@@ -512,20 +513,53 @@ def run_start_test(device: str, start_type: str, component: str, package: str, i
             parsed = parse_launch_times(launch["output"])
             total = parsed.get("TotalTime")
             if isinstance(total, int) and total > 0:
-                values.append(float(total))
+                slots[slot_index] = float(total)
             elif isinstance(total, int):
-                _debug_log(f"[{device}] Discarded non-positive {start_type} sample at iteration {i}: {total}")
+                _debug_log(f"[{device}] Discarded non-positive {start_type} sample at iteration {iteration}: {total}")
+            elif start_type == "warm":
+                pid = run_adb_command(["adb", "-s", device, "shell", "pidof", package], timeout=10, device_id=device)
+                pid_value = str(pid.get("output", "")).strip() if pid.get("success") else ""
+                if not pid_value:
+                    _start_app_with_retry(device, component, timeout=20, attempts=2)
+                    _debug_log(f"[{device}] warm iteration {iteration}: process_died — slot marked None")
+                else:
+                    run_adb_command(
+                        ["adb", "-s", device, "shell", "input", "keyevent", "KEYCODE_HOME"],
+                        timeout=10,
+                        device_id=device,
+                    )
+                    time.sleep(0.8)
+                    retry_launch = _start_app_with_retry(device, component, timeout=20, attempts=2)
+                    if retry_launch["success"]:
+                        retry_parsed = parse_launch_times(retry_launch["output"])
+                        retry_total = retry_parsed.get("TotalTime")
+                        if isinstance(retry_total, int) and retry_total > 0:
+                            slots[slot_index] = float(retry_total)
+                        else:
+                            LOGGER.warning(
+                                "[%s] warm iteration %d: no TotalTime after retry — slot marked None",
+                                device,
+                                iteration,
+                            )
+                    else:
+                        LOGGER.warning(
+                            "[%s] warm iteration %d: no TotalTime after retry — slot marked None",
+                            device,
+                            iteration,
+                        )
 
         time.sleep(2)
 
-    if values:
+    valid_values = [value for value in slots if isinstance(value, float)]
+    if valid_values:
         return {
-            "values": values,
-            "avg": round(mean(values), 2),
-            "min": round(min(values), 2),
-            "max": round(max(values), 2),
+            "values": slots,
+            "valid_count": len(valid_values),
+            "avg": round(mean(valid_values), 2),
+            "min": round(min(valid_values), 2),
+            "max": round(max(valid_values), 2),
         }
-    return {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"}
+    return {"values": slots, "valid_count": 0, "avg": "N/A", "min": "N/A", "max": "N/A"}
 
 
 def collect_performance_metrics(
@@ -639,6 +673,28 @@ def run_full_benchmark(target: str, package_name: str, activity_name: str, itera
         "warm": run_start_test(target, "warm", component, package_name, iterations),
         "hot": run_start_test(target, "hot", component, package_name, iterations),
     }
+    cold_valid = startup["cold"].get("valid_count", 0)
+    warm_valid = startup["warm"].get("valid_count", 0)
+    hot_valid = startup["hot"].get("valid_count", 0)
+    LOGGER.info(
+        "[%s] Startup sample summary — cold: %s/%s, warm: %s/%s, hot: %s/%s",
+        target,
+        cold_valid,
+        iterations,
+        warm_valid,
+        iterations,
+        hot_valid,
+        iterations,
+    )
+    for mode, valid_count in (("cold", cold_valid), ("warm", warm_valid), ("hot", hot_valid)):
+        if isinstance(valid_count, int) and iterations > 0 and (valid_count / iterations) < 0.7:
+            LOGGER.warning(
+                "[%s] WARNING: %s start only collected %s/%s valid samples — results may be unreliable",
+                target,
+                mode,
+                valid_count,
+                iterations,
+            )
 
     LOGGER.info("[%s] Benchmark step 4/4: Build benchmark result payload", target)
     result = {
@@ -687,20 +743,25 @@ def validate_benchmark_result(result: Dict[str, Any], target: str) -> Dict[str, 
     for mode in ("cold", "warm", "hot"):
         bucket = startup.get(mode)
         if not isinstance(bucket, dict):
-            startup[mode] = {"values": [], "avg": "N/A", "min": "N/A", "max": "N/A"}
+            startup[mode] = {"values": [], "valid_count": 0, "avg": "N/A", "min": "N/A", "max": "N/A"}
             continue
         original_values = bucket.get("values", [])
-        values = [float(v) for v in original_values if isinstance(v, (int, float)) and v > 0]
-        if len(values) != len(bucket.get("values", [])):
-            LOGGER.warning("[%s] startup %s had invalid values; filtered.", target, mode)
-        discarded_zeros = sum(1 for v in original_values if isinstance(v, (int, float)) and float(v) == 0.0)
-        if discarded_zeros:
-            LOGGER.info("[%s] startup %s discarded %d zero samples.", target, mode, discarded_zeros)
-        bucket["values"] = values
-        if values:
-            bucket["avg"] = round(_avg_of_values(values), 2)
-            bucket["min"] = round(min(values), 2)
-            bucket["max"] = round(max(values), 2)
+        normalized_values: List[float | None] = []
+        if isinstance(original_values, list):
+            for value in original_values:
+                if isinstance(value, (int, float)) and float(value) > 0.0:
+                    normalized_values.append(float(value))
+                else:
+                    normalized_values.append(None)
+        else:
+            LOGGER.warning("[%s] startup %s values were not a list; resetting.", target, mode)
+        valid_values = [value for value in normalized_values if isinstance(value, float)]
+        bucket["values"] = normalized_values
+        bucket["valid_count"] = len(valid_values)
+        if valid_values:
+            bucket["avg"] = round(_avg_of_values(valid_values), 2)
+            bucket["min"] = round(min(valid_values), 2)
+            bucket["max"] = round(max(valid_values), 2)
         else:
             bucket["avg"] = "N/A"
             bucket["min"] = "N/A"
